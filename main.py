@@ -66,6 +66,12 @@ PARTITION_MEMBER_CANDIDATES = (
     "cells_with_structure_partition.parquet",
     "cells_with_structure_partition.csv",
 )
+CELL_COORDINATE_MEMBER_CANDIDATES = (
+    "cells_with_structure_partition.parquet",
+    "cells_with_structure_partition.csv",
+    "cells.parquet",
+    "cells.csv",
+)
 PARTITION_STRUCTURE_ID_CANDIDATES = (
     "isoline_structure_id",
     "structure_id",
@@ -77,6 +83,18 @@ PARTITION_CONTOUR_ID_CANDIDATES = (
     "polygon_id",
     "contour_index",
     "isoline_polygon_id",
+)
+CELL_X_COORD_CANDIDATES = (
+    "x_centroid",
+    "x_location",
+    "x",
+    "X",
+)
+CELL_Y_COORD_CANDIDATES = (
+    "y_centroid",
+    "y_location",
+    "y",
+    "Y",
 )
 DEFAULT_BATCH_SIZE = 250000
 DEFAULT_BACKGROUND_SAMPLE = 60000
@@ -386,20 +404,143 @@ def read_bundle_table_subset(bundle_path: Path, member_name: str, columns: list[
     return pd.read_csv(io.StringIO(csv_text), usecols=lambda column_name: column_name in unique_columns)
 
 
+def geometric_contour_counts_from_member(
+    bundle_path: Path,
+    member_name: str,
+    contour_entries: list[dict[str, object]],
+    *,
+    structure_col: str | None,
+) -> tuple[dict[tuple[int, int], int], dict[int, int], str] | None:
+    columns = bundle_table_columns(bundle_path, member_name)
+    x_col = first_present_optional_column(columns, CELL_X_COORD_CANDIDATES)
+    y_col = first_present_optional_column(columns, CELL_Y_COORD_CANDIDATES)
+    if x_col is None or y_col is None:
+        return None
+
+    requested_columns = [x_col, y_col]
+    use_structure_col = structure_col if structure_col in columns else None
+    if use_structure_col is not None:
+        requested_columns.append(use_structure_col)
+    coord_df = read_bundle_table_subset(bundle_path, member_name, requested_columns)
+    coord_df = coord_df.dropna(subset=[x_col, y_col]).copy()
+    if coord_df.empty:
+        return None
+    coord_df[x_col] = pd.to_numeric(coord_df[x_col], errors="coerce")
+    coord_df[y_col] = pd.to_numeric(coord_df[y_col], errors="coerce")
+    coord_df = coord_df.loc[coord_df[x_col].notna() & coord_df[y_col].notna()].copy()
+    if coord_df.empty:
+        return None
+
+    points_by_structure: dict[int | None, tuple[np.ndarray, np.ndarray]] = {}
+    if use_structure_col is not None:
+        coord_df[use_structure_col] = pd.to_numeric(coord_df[use_structure_col], errors="coerce")
+        coord_df = coord_df.loc[coord_df[use_structure_col].notna()].copy()
+        if coord_df.empty:
+            return None
+        coord_df.loc[:, use_structure_col] = coord_df[use_structure_col].astype(int)
+        for structure_id, group in coord_df.groupby(use_structure_col, observed=True):
+            points_by_structure[int(structure_id)] = (
+                group[x_col].to_numpy(dtype=float),
+                group[y_col].to_numpy(dtype=float),
+            )
+    else:
+        points_by_structure[None] = (
+            coord_df[x_col].to_numpy(dtype=float),
+            coord_df[y_col].to_numpy(dtype=float),
+        )
+
+    contour_counts: dict[tuple[int, int], int] = {}
+    structure_counts: dict[int, int] = {}
+    for entry in contour_entries:
+        structure_id = int(entry["structure_id"])
+        contour_index = int(entry["contour_index"])
+        vertices = np.asarray(entry["vertices"], dtype=float)
+        if use_structure_col is not None:
+            x_values, y_values = points_by_structure.get(structure_id, (np.empty(0), np.empty(0)))
+        else:
+            x_values, y_values = points_by_structure[None]
+        if len(x_values) == 0:
+            contour_counts[(structure_id, contour_index)] = 0
+            continue
+
+        minx = float(np.min(vertices[:, 0]))
+        maxx = float(np.max(vertices[:, 0]))
+        miny = float(np.min(vertices[:, 1]))
+        maxy = float(np.max(vertices[:, 1]))
+        bbox_mask = (x_values >= minx) & (x_values <= maxx) & (y_values >= miny) & (y_values <= maxy)
+        if not bbox_mask.any():
+            contour_counts[(structure_id, contour_index)] = 0
+            continue
+
+        polygon = polygon_from_vertices(vertices)
+        if polygon is None or polygon.is_empty:
+            contour_counts[(structure_id, contour_index)] = 0
+            continue
+
+        inside_mask = contains_xy(polygon, x_values[bbox_mask], y_values[bbox_mask])
+        assigned_cell_count = int(np.count_nonzero(inside_mask))
+        contour_counts[(structure_id, contour_index)] = assigned_cell_count
+        structure_counts[structure_id] = structure_counts.get(structure_id, 0) + assigned_cell_count
+
+    basis = (
+        f"geometry counts from {member_name} restricted to the assigned structure column {use_structure_col}"
+        if use_structure_col is not None
+        else f"geometry counts from {member_name} using all cell coordinates"
+    )
+    return contour_counts, structure_counts, basis
+
+
 def load_partition_cell_counts(
     bundle_path: Path,
     contour_entries: list[dict[str, object]],
 ) -> dict[str, object]:
     member_name = first_existing_bundle_member(bundle_path, PARTITION_MEMBER_CANDIDATES)
     if member_name is None:
+        member_name = first_existing_bundle_member(bundle_path, CELL_COORDINATE_MEMBER_CANDIDATES)
+        if member_name is None:
+            return {
+                "available": False,
+                "reason": (
+                    "No cells_with_structure_partition or cells.parquet file was found in the contour bundle, "
+                    "so contour cell counts could not be estimated."
+                ),
+                "member_name": None,
+                "scope": "none",
+                "structure_counts": {},
+                "contour_counts": {},
+                "notes": [],
+            }
+        geometric_result = geometric_contour_counts_from_member(
+            bundle_path,
+            member_name,
+            contour_entries,
+            structure_col=None,
+        )
+        if geometric_result is None:
+            return {
+                "available": False,
+                "reason": (
+                    f"{member_name} was found, but it did not expose usable cell coordinate columns. "
+                    f"Looked for x columns {CELL_X_COORD_CANDIDATES} and y columns {CELL_Y_COORD_CANDIDATES}."
+                ),
+                "member_name": member_name,
+                "scope": "none",
+                "structure_counts": {},
+                "contour_counts": {},
+                "notes": [],
+            }
+        contour_counts, structure_counts, basis = geometric_result
         return {
-            "available": False,
-            "reason": "No cells_with_structure_partition.parquet or .csv was found in the contour bundle.",
-            "member_name": None,
-            "scope": "none",
-            "structure_counts": {},
-            "contour_counts": {},
-            "notes": [],
+            "available": True,
+            "reason": None,
+            "member_name": member_name,
+            "scope": "contour",
+            "structure_counts": structure_counts,
+            "contour_counts": contour_counts,
+            "notes": [
+                "No structure-partition table was available, so contour counts were estimated directly from cell coordinates.",
+                f"Count basis: {basis}.",
+            ],
         }
 
     try:
@@ -467,6 +608,29 @@ def load_partition_cell_counts(
     }
 
     if contour_col is None:
+        geometric_result = geometric_contour_counts_from_member(
+            bundle_path,
+            member_name,
+            contour_entries,
+            structure_col=structure_col,
+        )
+        if geometric_result is not None:
+            contour_counts, geometric_structure_counts, basis = geometric_result
+            return {
+                "available": True,
+                "reason": None,
+                "member_name": member_name,
+                "scope": "contour",
+                "structure_counts": geometric_structure_counts,
+                "contour_counts": contour_counts,
+                "notes": [
+                    (
+                        f"{member_name} had {structure_col} but no contour-level column, "
+                        "so contour counts were estimated geometrically instead."
+                    ),
+                    f"Count basis: {basis}.",
+                ],
+            }
         return {
             "available": True,
             "reason": None,
@@ -540,6 +704,30 @@ def load_partition_cell_counts(
                 normalized_contour_counts[(structure_id, mapped_contour_index)] = int(assigned_cell_count)
 
     if not normalized_contour_counts:
+        geometric_result = geometric_contour_counts_from_member(
+            bundle_path,
+            member_name,
+            contour_entries,
+            structure_col=structure_col,
+        )
+        if geometric_result is not None:
+            contour_counts, geometric_structure_counts, basis = geometric_result
+            return {
+                "available": True,
+                "reason": None,
+                "member_name": member_name,
+                "scope": "contour",
+                "structure_counts": geometric_structure_counts,
+                "contour_counts": contour_counts,
+                "notes": notes
+                + [
+                    (
+                        f"Could not align {contour_col} values in {member_name} to contour filenames, "
+                        "so contour counts were estimated geometrically instead."
+                    ),
+                    f"Count basis: {basis}.",
+                ],
+            }
         return {
             "available": True,
             "reason": None,
@@ -632,6 +820,22 @@ def load_contour_bundle(
         except Exception:
             structure_name_map = {}
 
+    for entry in contour_entries:
+        member_name = str(entry["member_name"])
+        try:
+            contour = np.load(io.BytesIO(read_bundle_bytes(bundle_path, member_name)), allow_pickle=False)
+        except Exception as exc:
+            raise ValueError(f"Could not read contour file {member_name}: {exc}") from exc
+        contour_arr = np.asarray(contour, dtype=float)
+        if contour_arr.ndim != 2 or contour_arr.shape[0] < 3 or contour_arr.shape[1] < 2:
+            entry["vertices"] = None
+            continue
+        entry["vertices"] = contour_arr[:, :2]
+
+    contour_entries = [entry for entry in contour_entries if entry.get("vertices") is not None]
+    if not contour_entries:
+        raise ValueError("Contour files were found, but none contained valid Nx2 polygon vertices.")
+
     total_contours_before_filter = int(len(contour_entries))
     contours_before_filter_by_structure: dict[int, int] = {}
     for entry in contour_entries:
@@ -699,20 +903,9 @@ def load_contour_bundle(
     contours_by_structure: dict[int, list[np.ndarray]] = {}
     contour_cell_counts_by_structure: dict[int, list[int | None]] = {}
     for entry in contour_entries:
-        member_name = str(entry["member_name"])
         structure_id = int(entry["structure_id"])
-        try:
-            contour = np.load(io.BytesIO(read_bundle_bytes(bundle_path, member_name)), allow_pickle=False)
-        except Exception as exc:
-            raise ValueError(f"Could not read contour file {member_name}: {exc}") from exc
-        contour_arr = np.asarray(contour, dtype=float)
-        if contour_arr.ndim != 2 or contour_arr.shape[0] < 3 or contour_arr.shape[1] < 2:
-            continue
-        contours_by_structure.setdefault(structure_id, []).append(contour_arr[:, :2])
+        contours_by_structure.setdefault(structure_id, []).append(np.asarray(entry["vertices"], dtype=float))
         contour_cell_counts_by_structure.setdefault(structure_id, []).append(entry.get("assigned_cell_count"))
-
-    if not contours_by_structure:
-        raise ValueError("Contour files were found, but none contained valid Nx2 polygon vertices.")
 
     structures: list[dict[str, object]] = []
     for structure_id in sorted(contours_by_structure):
