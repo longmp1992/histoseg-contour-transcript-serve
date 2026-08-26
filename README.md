@@ -10,10 +10,11 @@ It does not run HistoSeg itself. Instead, it expects:
 The app then:
 
 1. lists the structures found in the contour bundle
-2. lets the user choose one or more structures as the reference contour
-3. expands inward and outward from that contour inside the tissue region implied by all uploaded structures
-4. computes signed-distance transcript curves for all genes
-5. ranks the most spatially variant genes
+2. can optionally filter the bundle first so that only contours with more than a chosen number of assigned cells are kept
+3. lets the user choose one or more structures as the reference contour
+4. expands inward and outward from that contour inside the tissue region implied by all uploaded structures
+5. computes signed-distance transcript curves for all genes
+6. ranks the most spatially variant genes
 
 ## Accepted contour input
 
@@ -30,6 +31,8 @@ Optional files that improve labels or provenance:
 
 - `structure_contour_metrics.json`
 - `cells_with_structure_partition.parquet`
+
+If `cells_with_structure_partition.parquet` or `.csv` is present, the app can expose a pre-filter in the UI that keeps only contours with more than `N` assigned cells before the structure checklist is built.
 
 ## Accepted transcript input
 

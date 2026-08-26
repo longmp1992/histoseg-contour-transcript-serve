@@ -62,6 +62,22 @@ APP_DESCRIPTION = (
 INPUT_MODE_UPLOAD = "upload_files"
 INPUT_MODE_STORAGE = "mounted_storage"
 CONTOUR_PATTERN = re.compile(r"(?:^|/|\\)structure_(\d+)_contour_(\d+)\.npy$", re.IGNORECASE)
+PARTITION_MEMBER_CANDIDATES = (
+    "cells_with_structure_partition.parquet",
+    "cells_with_structure_partition.csv",
+)
+PARTITION_STRUCTURE_ID_CANDIDATES = (
+    "isoline_structure_id",
+    "structure_id",
+    "selected_structure_id",
+)
+PARTITION_CONTOUR_ID_CANDIDATES = (
+    "isoline_contour_id",
+    "contour_id",
+    "polygon_id",
+    "contour_index",
+    "isoline_polygon_id",
+)
 DEFAULT_BATCH_SIZE = 250000
 DEFAULT_BACKGROUND_SAMPLE = 60000
 DEFAULT_TOP_GENE_SAMPLE = 50000
@@ -331,6 +347,233 @@ def extract_bundle_member_to_path(bundle_path: Path, member_name: str, target_pa
     return target_path
 
 
+def first_present_optional_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    return next((candidate for candidate in candidates if candidate in columns), None)
+
+
+def first_existing_bundle_member(bundle_path: Path, candidates: tuple[str, ...]) -> str | None:
+    return next((candidate for candidate in candidates if bundle_member_exists(bundle_path, candidate)), None)
+
+
+def bundle_table_columns(bundle_path: Path, member_name: str) -> list[str]:
+    if member_name.lower().endswith(".parquet"):
+        if pq is None:
+            raise ValueError("pyarrow.parquet is required to inspect cells_with_structure_partition.parquet.")
+        source: object
+        if bundle_is_zip(bundle_path):
+            source = io.BytesIO(read_bundle_bytes(bundle_path, member_name))
+        else:
+            source = bundle_path / member_name
+        return [str(name) for name in pq.ParquetFile(source).schema.names]
+
+    csv_text = read_bundle_bytes(bundle_path, member_name).decode("utf-8", errors="replace")
+    return [str(name) for name in pd.read_csv(io.StringIO(csv_text), nrows=0).columns]
+
+
+def read_bundle_table_subset(bundle_path: Path, member_name: str, columns: list[str]) -> pd.DataFrame:
+    unique_columns = list(dict.fromkeys(columns))
+    if member_name.lower().endswith(".parquet"):
+        if pq is None:
+            raise ValueError("pyarrow.parquet is required to read cells_with_structure_partition.parquet.")
+        source: object
+        if bundle_is_zip(bundle_path):
+            source = io.BytesIO(read_bundle_bytes(bundle_path, member_name))
+        else:
+            source = bundle_path / member_name
+        return pq.read_table(source, columns=unique_columns).to_pandas()
+
+    csv_text = read_bundle_bytes(bundle_path, member_name).decode("utf-8", errors="replace")
+    return pd.read_csv(io.StringIO(csv_text), usecols=lambda column_name: column_name in unique_columns)
+
+
+def load_partition_cell_counts(
+    bundle_path: Path,
+    contour_entries: list[dict[str, object]],
+) -> dict[str, object]:
+    member_name = first_existing_bundle_member(bundle_path, PARTITION_MEMBER_CANDIDATES)
+    if member_name is None:
+        return {
+            "available": False,
+            "reason": "No cells_with_structure_partition.parquet or .csv was found in the contour bundle.",
+            "member_name": None,
+            "scope": "none",
+            "structure_counts": {},
+            "contour_counts": {},
+            "notes": [],
+        }
+
+    try:
+        columns = bundle_table_columns(bundle_path, member_name)
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"Could not inspect {member_name}: {exc}",
+            "member_name": member_name,
+            "scope": "none",
+            "structure_counts": {},
+            "contour_counts": {},
+            "notes": [],
+        }
+
+    structure_col = first_present_optional_column(columns, PARTITION_STRUCTURE_ID_CANDIDATES)
+    contour_col = first_present_optional_column(columns, PARTITION_CONTOUR_ID_CANDIDATES)
+    if structure_col is None:
+        return {
+            "available": False,
+            "reason": (
+                f"{member_name} did not contain any recognized structure assignment column. "
+                f"Looked for: {', '.join(PARTITION_STRUCTURE_ID_CANDIDATES)}."
+            ),
+            "member_name": member_name,
+            "scope": "none",
+            "structure_counts": {},
+            "contour_counts": {},
+            "notes": [],
+        }
+
+    requested_columns = [structure_col]
+    if contour_col is not None:
+        requested_columns.append(contour_col)
+    try:
+        partition_df = read_bundle_table_subset(bundle_path, member_name, requested_columns)
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"Could not read {member_name}: {exc}",
+            "member_name": member_name,
+            "scope": "none",
+            "structure_counts": {},
+            "contour_counts": {},
+            "notes": [],
+        }
+
+    partition_df = partition_df.dropna(subset=[structure_col]).copy()
+    partition_df[structure_col] = pd.to_numeric(partition_df[structure_col], errors="coerce")
+    partition_df = partition_df.loc[partition_df[structure_col].notna()].copy()
+    if partition_df.empty:
+        return {
+            "available": False,
+            "reason": f"{member_name} did not contain any usable structure assignments after cleaning.",
+            "member_name": member_name,
+            "scope": "none",
+            "structure_counts": {},
+            "contour_counts": {},
+            "notes": [],
+        }
+    partition_df.loc[:, structure_col] = partition_df[structure_col].astype(int)
+    structure_counts = {
+        int(structure_id): int(cell_count)
+        for structure_id, cell_count in partition_df.groupby(structure_col, observed=True).size().items()
+    }
+
+    if contour_col is None:
+        return {
+            "available": True,
+            "reason": None,
+            "member_name": member_name,
+            "scope": "structure",
+            "structure_counts": structure_counts,
+            "contour_counts": {},
+            "notes": [
+                (
+                    f"{member_name} had {structure_col} but no contour-level column. "
+                    "The filter will fall back to structure-level assigned-cell counts."
+                )
+            ],
+        }
+
+    contour_df = partition_df.dropna(subset=[contour_col]).copy()
+    contour_df[contour_col] = pd.to_numeric(contour_df[contour_col], errors="coerce")
+    contour_df = contour_df.loc[contour_df[contour_col].notna()].copy()
+    if contour_df.empty:
+        return {
+            "available": True,
+            "reason": None,
+            "member_name": member_name,
+            "scope": "structure",
+            "structure_counts": structure_counts,
+            "contour_counts": {},
+            "notes": [
+                (
+                    f"{member_name} had {contour_col}, but it became empty after numeric cleanup. "
+                    "The filter will fall back to structure-level assigned-cell counts."
+                )
+            ],
+        }
+    contour_df.loc[:, contour_col] = contour_df[contour_col].astype(int)
+
+    raw_contour_counts: dict[int, dict[int, int]] = {}
+    grouped = (
+        contour_df.groupby([structure_col, contour_col], observed=True)
+        .size()
+        .reset_index(name="assigned_cell_count")
+    )
+    for row in grouped.itertuples(index=False):
+        structure_id = int(getattr(row, structure_col))
+        contour_id = int(getattr(row, contour_col))
+        raw_contour_counts.setdefault(structure_id, {})[contour_id] = int(row.assigned_cell_count)
+
+    available_contours_by_structure: dict[int, set[int]] = {}
+    for entry in contour_entries:
+        structure_id = int(entry["structure_id"])
+        contour_index = int(entry["contour_index"])
+        available_contours_by_structure.setdefault(structure_id, set()).add(contour_index)
+
+    normalized_contour_counts: dict[tuple[int, int], int] = {}
+    notes: list[str] = []
+    for structure_id, contour_map in raw_contour_counts.items():
+        available_indices = available_contours_by_structure.get(structure_id, set())
+        if not available_indices:
+            continue
+
+        direct_matches = sum(1 for contour_id in contour_map if contour_id in available_indices)
+        shifted_matches = sum(1 for contour_id in contour_map if (contour_id - 1) in available_indices)
+        subtract_one = shifted_matches > direct_matches
+        if subtract_one and shifted_matches > 0:
+            notes.append(
+                f"Matched contour assignments for structure S{structure_id} after shifting {contour_col} from 1-based to 0-based indexing."
+            )
+
+        for contour_id, assigned_cell_count in contour_map.items():
+            mapped_contour_index = contour_id - 1 if subtract_one else contour_id
+            if mapped_contour_index in available_indices:
+                normalized_contour_counts[(structure_id, mapped_contour_index)] = int(assigned_cell_count)
+
+    if not normalized_contour_counts:
+        return {
+            "available": True,
+            "reason": None,
+            "member_name": member_name,
+            "scope": "structure",
+            "structure_counts": structure_counts,
+            "contour_counts": {},
+            "notes": notes
+            + [
+                (
+                    f"Could not align {contour_col} values in {member_name} to the contour filenames. "
+                    "The filter will fall back to structure-level assigned-cell counts."
+                )
+            ],
+        }
+
+    matched_contours = len(normalized_contour_counts)
+    total_contours = len(contour_entries)
+    if matched_contours < total_contours:
+        notes.append(
+            f"Resolved contour-level cell counts for {matched_contours} of {total_contours} contour files from {member_name}. Unmatched contours are treated as having 0 assigned cells."
+        )
+
+    return {
+        "available": True,
+        "reason": None,
+        "member_name": member_name,
+        "scope": "contour",
+        "structure_counts": structure_counts,
+        "contour_counts": normalized_contour_counts,
+        "notes": notes,
+    }
+
+
 def safe_filename_component(raw: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(raw).strip())
     cleaned = cleaned.strip("._")
@@ -359,15 +602,21 @@ def load_contour_bundle(
     bundle_path: Path,
     *,
     include_polygons: bool,
+    filter_contours_by_assigned_cells: bool = False,
+    min_assigned_cells_threshold: int = 10,
 ) -> dict[str, object]:
     member_names = list_bundle_members(bundle_path)
     contour_matches = [CONTOUR_PATTERN.match(name) for name in member_names]
-    contour_files = [
-        (name, int(match.group(1)), int(match.group(2)))
+    contour_entries = [
+        {
+            "member_name": name,
+            "structure_id": int(match.group(1)),
+            "contour_index": int(match.group(2)),
+        }
         for name, match in zip(member_names, contour_matches)
         if match is not None
     ]
-    if not contour_files:
+    if not contour_entries:
         raise ValueError(
             "Could not find any HistoSeg contour files in the bundle. Expected files like "
             "'structure_1_contour_0.npy'."
@@ -383,8 +632,75 @@ def load_contour_bundle(
         except Exception:
             structure_name_map = {}
 
+    total_contours_before_filter = int(len(contour_entries))
+    contours_before_filter_by_structure: dict[int, int] = {}
+    for entry in contour_entries:
+        structure_id = int(entry["structure_id"])
+        contours_before_filter_by_structure[structure_id] = contours_before_filter_by_structure.get(structure_id, 0) + 1
+
+    partition_counts = load_partition_cell_counts(bundle_path, contour_entries)
+    contour_filter = {
+        "requested": bool(filter_contours_by_assigned_cells),
+        "applied": False,
+        "scope": str(partition_counts.get("scope", "none")),
+        "member_name": partition_counts.get("member_name"),
+        "min_assigned_cells_threshold": int(min_assigned_cells_threshold),
+        "total_contours_before_filter": total_contours_before_filter,
+        "kept_contours_after_filter": total_contours_before_filter,
+        "removed_contours": 0,
+        "reason": partition_counts.get("reason"),
+        "notes": list(partition_counts.get("notes", [])),
+    }
+
+    if partition_counts.get("available"):
+        scope = str(partition_counts["scope"])
+        structure_counts_lookup = {
+            int(structure_id): int(cell_count)
+            for structure_id, cell_count in dict(partition_counts.get("structure_counts", {})).items()
+        }
+        contour_counts_lookup = {
+            (int(structure_id), int(contour_index)): int(cell_count)
+            for (structure_id, contour_index), cell_count in dict(partition_counts.get("contour_counts", {})).items()
+        }
+
+        for entry in contour_entries:
+            structure_id = int(entry["structure_id"])
+            contour_index = int(entry["contour_index"])
+            assigned_cell_count: int | None
+            if scope == "contour":
+                assigned_cell_count = contour_counts_lookup.get((structure_id, contour_index), 0)
+            else:
+                assigned_cell_count = structure_counts_lookup.get(structure_id, 0)
+            entry["assigned_cell_count"] = assigned_cell_count
+    else:
+        for entry in contour_entries:
+            entry["assigned_cell_count"] = None
+
+    if filter_contours_by_assigned_cells:
+        if not partition_counts.get("available"):
+            contour_filter["reason"] = partition_counts.get("reason")
+        else:
+            kept_entries = [
+                entry
+                for entry in contour_entries
+                if int(entry.get("assigned_cell_count") or 0) > int(min_assigned_cells_threshold)
+            ]
+            if not kept_entries:
+                raise ValueError(
+                    "The contour-cell filter removed every contour in the bundle. "
+                    "Lower the threshold or disable the filter."
+                )
+            contour_entries = kept_entries
+            contour_filter["applied"] = True
+            contour_filter["kept_contours_after_filter"] = int(len(contour_entries))
+            contour_filter["removed_contours"] = int(total_contours_before_filter - len(contour_entries))
+            contour_filter["reason"] = None
+
     contours_by_structure: dict[int, list[np.ndarray]] = {}
-    for member_name, structure_id, _contour_index in contour_files:
+    contour_cell_counts_by_structure: dict[int, list[int | None]] = {}
+    for entry in contour_entries:
+        member_name = str(entry["member_name"])
+        structure_id = int(entry["structure_id"])
         try:
             contour = np.load(io.BytesIO(read_bundle_bytes(bundle_path, member_name)), allow_pickle=False)
         except Exception as exc:
@@ -393,6 +709,7 @@ def load_contour_bundle(
         if contour_arr.ndim != 2 or contour_arr.shape[0] < 3 or contour_arr.shape[1] < 2:
             continue
         contours_by_structure.setdefault(structure_id, []).append(contour_arr[:, :2])
+        contour_cell_counts_by_structure.setdefault(structure_id, []).append(entry.get("assigned_cell_count"))
 
     if not contours_by_structure:
         raise ValueError("Contour files were found, but none contained valid Nx2 polygon vertices.")
@@ -401,11 +718,20 @@ def load_contour_bundle(
     for structure_id in sorted(contours_by_structure):
         contours = contours_by_structure[structure_id]
         stacked = np.vstack(contours)
+        contour_assigned_counts = contour_cell_counts_by_structure.get(structure_id, [])
+        assigned_cell_count = None
+        if any(count is not None for count in contour_assigned_counts):
+            if str(partition_counts.get("scope")) == "contour":
+                assigned_cell_count = int(sum(int(count or 0) for count in contour_assigned_counts))
+            else:
+                assigned_cell_count = int(contour_assigned_counts[0] or 0)
         structures.append(
             {
                 "structure_id": int(structure_id),
                 "structure_name": structure_name_map.get(structure_id, f"Structure {structure_id}"),
                 "n_contours": int(len(contours)),
+                "n_contours_before_filter": int(contours_before_filter_by_structure.get(structure_id, len(contours))),
+                "assigned_cell_count": assigned_cell_count,
                 "bbox_xmin": float(np.min(stacked[:, 0])),
                 "bbox_xmax": float(np.max(stacked[:, 0])),
                 "bbox_ymin": float(np.min(stacked[:, 1])),
@@ -420,6 +746,7 @@ def load_contour_bundle(
         "has_metrics_json": bundle_member_exists(bundle_path, "structure_contour_metrics.json"),
         "has_partition_file": bundle_member_exists(bundle_path, "cells_with_structure_partition.parquet")
         or bundle_member_exists(bundle_path, "cells_with_structure_partition.csv"),
+        "contour_filter": contour_filter,
         "structure_count": int(len(structures)),
         "structures": structures,
     }
@@ -429,23 +756,40 @@ def build_structure_choice_label(record: dict[str, object]) -> str:
     structure_id = int(record["structure_id"])
     structure_name = str(record["structure_name"])
     contour_count = int(record["n_contours"])
-    return f"S{structure_id} | {structure_name} | contours={contour_count}"
+    label = f"S{structure_id} | {structure_name} | contours={contour_count}"
+    assigned_cell_count = record.get("assigned_cell_count")
+    if assigned_cell_count is not None:
+        label += f" | cells={int(assigned_cell_count)}"
+    return label
 
 
 def build_structure_table(bundle_meta: dict[str, object]) -> pd.DataFrame:
+    show_assigned_cell_count = any(record.get("assigned_cell_count") is not None for record in bundle_meta["structures"])
+    show_pre_filter_contours = any(
+        int(record.get("n_contours_before_filter", record["n_contours"])) != int(record["n_contours"])
+        for record in bundle_meta["structures"]
+    )
     rows: list[dict[str, object]] = []
     for record in bundle_meta["structures"]:
-        rows.append(
+        row = {
+            "structure_id": int(record["structure_id"]),
+            "structure_name": str(record["structure_name"]),
+            "contour_count": int(record["n_contours"]),
+        }
+        if show_pre_filter_contours:
+            row["contours_before_filter"] = int(record.get("n_contours_before_filter", record["n_contours"]))
+        if show_assigned_cell_count:
+            assigned_cell_count = record.get("assigned_cell_count")
+            row["assigned_cell_count"] = int(assigned_cell_count) if assigned_cell_count is not None else None
+        row.update(
             {
-                "structure_id": int(record["structure_id"]),
-                "structure_name": str(record["structure_name"]),
-                "contour_count": int(record["n_contours"]),
                 "bbox_xmin": round(float(record["bbox_xmin"]), 2),
                 "bbox_xmax": round(float(record["bbox_xmax"]), 2),
                 "bbox_ymin": round(float(record["bbox_ymin"]), 2),
                 "bbox_ymax": round(float(record["bbox_ymax"]), 2),
             }
         )
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -1058,6 +1402,8 @@ def load_contour_bundle_metadata(
     input_mode: str,
     contour_bundle_upload: object | None,
     contour_bundle_storage_path: str | None,
+    filter_contours_by_assigned_cells: bool,
+    min_assigned_cells_threshold: float,
 ):
     if SHAPELY_IMPORT_ERROR is not None:
         raise gr.Error(
@@ -1074,7 +1420,12 @@ def load_contour_bundle_metadata(
         contour_bundle_storage_path=contour_bundle_storage_path,
         target_dir=preview_dir,
     )
-    bundle_meta = load_contour_bundle(bundle_input.path, include_polygons=True)
+    bundle_meta = load_contour_bundle(
+        bundle_input.path,
+        include_polygons=True,
+        filter_contours_by_assigned_cells=bool(filter_contours_by_assigned_cells),
+        min_assigned_cells_threshold=int(min_assigned_cells_threshold),
+    )
     structure_table = build_structure_table(bundle_meta)
     choices = [build_structure_choice_label(record) for record in bundle_meta["structures"]]
     choice_to_id = {label: int(record["structure_id"]) for label, record in zip(choices, bundle_meta["structures"])}
@@ -1089,8 +1440,30 @@ def load_contour_bundle_metadata(
         f"Structures discovered: {bundle_meta['structure_count']}",
         f"Has structure_contour_metrics.json: {bundle_meta['has_metrics_json']}",
         f"Has cells_with_structure_partition file: {bundle_meta['has_partition_file']}",
+        (
+            "Contour-cell filter requested: "
+            f"{'yes' if filter_contours_by_assigned_cells else 'no'}"
+        ),
         "Select one or more structures below, then upload transcript.parquet and run the transcript analysis.",
     ]
+    contour_filter = dict(bundle_meta.get("contour_filter", {}))
+    if contour_filter.get("requested"):
+        if contour_filter.get("applied"):
+            basis = "contour-level" if contour_filter.get("scope") == "contour" else "structure-level"
+            status_lines.append(
+                "Contour-cell filter applied: kept "
+                f"{contour_filter.get('kept_contours_after_filter')} of "
+                f"{contour_filter.get('total_contours_before_filter')} contours "
+                f"with more than {contour_filter.get('min_assigned_cells_threshold')} assigned cells "
+                f"using {basis} counts from {contour_filter.get('member_name')}."
+            )
+        else:
+            status_lines.append(
+                "Contour-cell filter was not applied: "
+                f"{contour_filter.get('reason') or 'the bundle did not expose usable assigned-cell counts.'}"
+            )
+    for note in contour_filter.get("notes", []):
+        status_lines.append(f"Filter note: {note}")
     if removed_previews:
         status_lines.append(f"Cleaned old preview directories: {', '.join(removed_previews)}")
 
@@ -1106,9 +1479,14 @@ def load_contour_bundle_metadata(
                 "structure_id": int(record["structure_id"]),
                 "structure_name": str(record["structure_name"]),
                 "n_contours": int(record["n_contours"]),
+                "n_contours_before_filter": int(record.get("n_contours_before_filter", record["n_contours"])),
+                "assigned_cell_count": (
+                    int(record["assigned_cell_count"]) if record.get("assigned_cell_count") is not None else None
+                ),
             }
             for record in bundle_meta["structures"]
         ],
+        "contour_filter": contour_filter,
     }
     return (
         "\n".join(status_lines),
@@ -1165,7 +1543,13 @@ def run_contour_transcript_analysis(
         )
 
         progress(0.12, desc="Parsing contour structures")
-        bundle_meta = load_contour_bundle(contour_input.path, include_polygons=True)
+        contour_filter_state = dict((bundle_state or {}).get("contour_filter", {}))
+        bundle_meta = load_contour_bundle(
+            contour_input.path,
+            include_polygons=True,
+            filter_contours_by_assigned_cells=bool(contour_filter_state.get("requested", False)),
+            min_assigned_cells_threshold=int(contour_filter_state.get("min_assigned_cells_threshold", 10)),
+        )
         label_to_id = dict(bundle_state.get("choice_to_id", {})) if bundle_state else {}
         if not label_to_id:
             label_to_id = {
@@ -1315,9 +1699,14 @@ def run_contour_transcript_analysis(
                     "structure_id": int(record["structure_id"]),
                     "structure_name": str(record["structure_name"]),
                     "contour_count": int(record["n_contours"]),
+                    "contours_before_filter": int(record.get("n_contours_before_filter", record["n_contours"])),
+                    "assigned_cell_count": (
+                        int(record["assigned_cell_count"]) if record.get("assigned_cell_count") is not None else None
+                    ),
                 }
                 for record in selected_records
             ],
+            "contour_filter": bundle_meta.get("contour_filter", {}),
             "parameters": {
                 "qv_min": float(qv_min),
                 "grid_resolution_um": float(grid_resolution_um),
@@ -1362,6 +1751,19 @@ def run_contour_transcript_analysis(
             f"Top score: {float(ranking_df.iloc[0]['distance_profile_variation_score']):.4f}",
             f"Elapsed time: {elapsed} seconds",
         ]
+        active_contour_filter = dict(bundle_meta.get("contour_filter", {}))
+        if active_contour_filter.get("requested"):
+            if active_contour_filter.get("applied"):
+                status_lines.append(
+                    "Contour-cell filter was active during analysis: kept "
+                    f"{active_contour_filter.get('kept_contours_after_filter')} of "
+                    f"{active_contour_filter.get('total_contours_before_filter')} contours."
+                )
+            else:
+                status_lines.append(
+                    "Contour-cell filter was requested but not applied: "
+                    f"{active_contour_filter.get('reason') or 'usable assigned-cell counts were unavailable.'}"
+                )
         if removed_runs:
             status_lines.append(f"Cleaned old run directories: {', '.join(removed_runs)}")
         if archive_note:
@@ -1571,6 +1973,23 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
         load_bundle_button = gr.Button("1. Load contour bundle and list structures", variant="secondary")
 
     with gr.Row():
+        filter_contours_by_assigned_cells = gr.Checkbox(
+            label="Filter contour bundle by assigned cells before structure selection",
+            value=False,
+            info=(
+                "When the bundle contains cells_with_structure_partition, keep only contours with more than the threshold "
+                "below. If only structure-level assignments are available, the filter falls back to structure-level counts."
+            ),
+        )
+        min_assigned_cells_threshold = gr.Slider(
+            label="Keep only contours with more than this many assigned cells",
+            minimum=0,
+            maximum=500,
+            step=1,
+            value=10,
+        )
+
+    with gr.Row():
         structure_selector = gr.CheckboxGroup(
             label="Structures to use as the contour reference",
             choices=[],
@@ -1639,7 +2058,13 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
 
     load_bundle_button.click(
         fn=load_contour_bundle_metadata,
-        inputs=[input_mode, contour_bundle_upload, contour_bundle_storage_path],
+        inputs=[
+            input_mode,
+            contour_bundle_upload,
+            contour_bundle_storage_path,
+            filter_contours_by_assigned_cells,
+            min_assigned_cells_threshold,
+        ],
         outputs=[
             contour_status,
             contour_preview,
