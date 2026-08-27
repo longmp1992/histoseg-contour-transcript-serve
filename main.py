@@ -809,6 +809,16 @@ def build_contour_polygon_records(structure_records: list[dict[str, object]]) ->
     return contour_records
 
 
+def compute_structure_area_um2(contours: list[np.ndarray]) -> float | None:
+    if SHAPELY_IMPORT_ERROR is not None:
+        return None
+    polygons = [polygon_from_vertices(contour) for contour in contours]
+    valid_polygons = [polygon for polygon in polygons if polygon is not None and not polygon.is_empty]
+    if not valid_polygons:
+        return None
+    return float(unary_union(valid_polygons).area)
+
+
 def grid_slice_for_bounds(
     *,
     bounds: tuple[float, float, float, float],
@@ -1002,6 +1012,10 @@ def load_contour_bundle(
                 assigned_cell_count = int(sum(int(count or 0) for count in contour_assigned_counts))
             else:
                 assigned_cell_count = int(contour_assigned_counts[0] or 0)
+        structure_area_um2 = compute_structure_area_um2(contours)
+        cell_density_per_mm2 = None
+        if assigned_cell_count is not None and structure_area_um2 is not None and structure_area_um2 > 0:
+            cell_density_per_mm2 = float(assigned_cell_count) / (float(structure_area_um2) / 1e6)
         structures.append(
             {
                 "structure_id": int(structure_id),
@@ -1009,6 +1023,8 @@ def load_contour_bundle(
                 "n_contours": int(len(contours)),
                 "n_contours_before_filter": int(contours_before_filter_by_structure.get(structure_id, len(contours))),
                 "assigned_cell_count": assigned_cell_count,
+                "structure_area_um2": structure_area_um2,
+                "cell_density_per_mm2": cell_density_per_mm2,
                 "bbox_xmin": float(np.min(stacked[:, 0])),
                 "bbox_xmax": float(np.max(stacked[:, 0])),
                 "bbox_ymin": float(np.min(stacked[:, 1])),
@@ -1042,6 +1058,7 @@ def build_structure_choice_label(record: dict[str, object]) -> str:
 
 def build_structure_table(bundle_meta: dict[str, object]) -> pd.DataFrame:
     show_assigned_cell_count = any(record.get("assigned_cell_count") is not None for record in bundle_meta["structures"])
+    show_cell_density = any(record.get("cell_density_per_mm2") is not None for record in bundle_meta["structures"])
     show_pre_filter_contours = any(
         int(record.get("n_contours_before_filter", record["n_contours"])) != int(record["n_contours"])
         for record in bundle_meta["structures"]
@@ -1058,14 +1075,9 @@ def build_structure_table(bundle_meta: dict[str, object]) -> pd.DataFrame:
         if show_assigned_cell_count:
             assigned_cell_count = record.get("assigned_cell_count")
             row["assigned_cell_count"] = int(assigned_cell_count) if assigned_cell_count is not None else None
-        row.update(
-            {
-                "bbox_xmin": round(float(record["bbox_xmin"]), 2),
-                "bbox_xmax": round(float(record["bbox_xmax"]), 2),
-                "bbox_ymin": round(float(record["bbox_ymin"]), 2),
-                "bbox_ymax": round(float(record["bbox_ymax"]), 2),
-            }
-        )
+        if show_cell_density:
+            cell_density = record.get("cell_density_per_mm2")
+            row["cell_density_per_mm2"] = round(float(cell_density), 2) if cell_density is not None else None
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1814,6 +1826,9 @@ def load_contour_bundle_metadata(
                 "assigned_cell_count": (
                     int(record["assigned_cell_count"]) if record.get("assigned_cell_count") is not None else None
                 ),
+                "cell_density_per_mm2": (
+                    float(record["cell_density_per_mm2"]) if record.get("cell_density_per_mm2") is not None else None
+                ),
             }
             for record in bundle_meta["structures"]
         ],
@@ -2030,6 +2045,9 @@ def run_contour_transcript_analysis(
                     "contours_before_filter": int(record.get("n_contours_before_filter", record["n_contours"])),
                     "assigned_cell_count": (
                         int(record["assigned_cell_count"]) if record.get("assigned_cell_count") is not None else None
+                    ),
+                    "cell_density_per_mm2": (
+                        float(record["cell_density_per_mm2"]) if record.get("cell_density_per_mm2") is not None else None
                     ),
                 }
                 for record in selected_records
