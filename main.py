@@ -1184,7 +1184,6 @@ def build_analysis_grid(
     selected_geometry: Any,
     tissue_geometry: Any,
     contour_records: list[dict[str, object]],
-    selected_structure_ids: set[int],
     grid_resolution_um: float,
     max_distance_um: float,
 ) -> dict[str, np.ndarray | float]:
@@ -1217,12 +1216,7 @@ def build_analysis_grid(
     outside_dist = distance_transform_edt(~target_mask) * float(grid_resolution_um)
     _, nearest_indices = distance_transform_edt(~boundary_mask, return_indices=True)
     nearest_owner = boundary_owner[nearest_indices[0], nearest_indices[1]]
-    selected_owner_ids = {
-        owner_index
-        for owner_index, contour_record in enumerate(contour_records)
-        if int(contour_record["structure_id"]) in selected_structure_ids
-    }
-    outward_voronoi_mask = (~target_mask) & tissue_mask & np.isin(nearest_owner, list(selected_owner_ids))
+    outward_voronoi_mask = (~target_mask) & tissue_mask & (nearest_owner >= 0)
 
     signed_distance = outside_dist.astype(float)
     signed_distance[target_mask] = -inside_dist[target_mask]
@@ -1764,7 +1758,7 @@ def load_contour_bundle_metadata(
         f"Has structure_contour_metrics.json: {bundle_meta['has_metrics_json']}",
         f"Has cells_with_structure_partition file: {bundle_meta['has_partition_file']}",
         "Signed distance convention for analysis: negative inside, positive outside.",
-        "Outside expansion rule: Voronoi-style, so outward regions stop when another contour becomes closer.",
+        "Outside expansion rule: Voronoi-style among selected contours only; unselected structures do not block expansion.",
         (
             "Contour-cell filter requested: "
             f"{'yes' if filter_contours_by_assigned_cells else 'no'}"
@@ -1923,8 +1917,7 @@ def run_contour_transcript_analysis(
         grid_state = build_analysis_grid(
             selected_geometry=selected_geometry,
             tissue_geometry=tissue_geometry,
-            contour_records=all_contour_records,
-            selected_structure_ids=selected_ids,
+            contour_records=selected_contour_records,
             grid_resolution_um=float(grid_resolution_um),
             max_distance_um=float(max_distance_um),
         )
@@ -2038,7 +2031,7 @@ def run_contour_transcript_analysis(
                 "min_transcripts_per_gene": int(min_transcripts_per_gene),
                 "top_n_genes": int(top_n_genes),
                 "signed_distance_convention": "negative_inside_positive_outside",
-                "outward_assignment_mode": "voronoi_nearest_contour_within_tissue",
+                "outward_assignment_mode": "voronoi_among_selected_contours_only",
             },
             "aggregation_stats": aggregation_stats,
             "top_gene": top_gene,
@@ -2070,7 +2063,7 @@ def run_contour_transcript_analysis(
             f"Run directory: {run_dir}",
             f"Selected structures analyzed: {len(selected_records)}",
             "Signed distance convention: negative inside, positive outside.",
-            "Outward expansion mode: Voronoi-style, keeping only points whose nearest contour belongs to the selected structures.",
+            "Outward expansion mode: Voronoi-style among selected contours only; unselected structures do not block expansion.",
             f"Transcript rows seen: {aggregation_stats['rows_seen']}",
             f"Transcript rows counted after filtering: {aggregation_stats['rows_counted']}",
             f"Genes ranked: {len(ranking_df)}",
@@ -2236,7 +2229,7 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
               <div class="micro-step">
                 <strong>Step 2</strong>
                 <h3>Select structures</h3>
-                <p>Choose one or more structures whose contours define the signed distance reference and Voronoi-style outward ownership.</p>
+                <p>Choose one or more structures whose contours define the signed distance reference; only selected contours compete for Voronoi-style outward ownership.</p>
               </div>
               <div class="micro-step">
                 <strong>Step 3</strong>
@@ -2323,7 +2316,8 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             value=[],
             info=(
                 "Select one or more uploaded structures. Inside each selected contour is treated as negative distance, "
-                "and outward positive-distance regions are assigned Voronoi-style until another contour becomes closer."
+                "and outward positive-distance regions are assigned Voronoi-style only among selected contours. "
+                "Unselected structures do not block expansion."
             ),
         )
 
