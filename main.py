@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
+from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.ndimage import binary_erosion, distance_transform_edt
 
 try:
@@ -1621,21 +1622,32 @@ def render_variation_heatmap(
             values = values - float(np.mean(values))
         matrix_rows.append(values)
     heatmap = np.vstack(matrix_rows)
+    clustered_genes = list(top_genes)
+    if len(top_genes) > 1:
+        linkage_matrix = linkage(heatmap, method="average", metric="euclidean")
+        cluster_order = leaves_list(linkage_matrix).astype(int)
+        heatmap = heatmap[cluster_order, :]
+        clustered_genes = [top_genes[idx] for idx in cluster_order]
 
     fig, ax = plt.subplots(figsize=(12.6, max(5.4, 0.42 * len(top_genes) + 2.0)))
     fig.patch.set_facecolor("#08111B")
     ax.set_facecolor("#08111B")
     image = ax.imshow(heatmap, aspect="auto", cmap="coolwarm", interpolation="nearest")
     ax.set_yticks(np.arange(len(top_genes)))
-    ax.set_yticklabels(top_genes, color="#EAF2FA", fontsize=8)
+    ax.set_yticklabels(clustered_genes, color="#EAF2FA", fontsize=8)
 
     bin_centers = density_wide_df["bin_center_um"].to_numpy(dtype=float)
     tick_step = max(1, len(bin_centers) // 10)
     tick_idx = np.arange(0, len(bin_centers), tick_step)
     ax.set_xticks(tick_idx)
     ax.set_xticklabels([f"{int(round(bin_centers[idx]))}" for idx in tick_idx], color="#C7D7E7", fontsize=8)
+    if len(bin_centers) == 1:
+        zero_position = 0.0
+    else:
+        zero_position = float(np.interp(0.0, bin_centers, np.arange(len(bin_centers), dtype=float)))
+    ax.axvline(zero_position, color="#EAF2FA", linestyle="--", linewidth=1.1, alpha=0.9)
     ax.set_xlabel("Signed distance from contour (um)", color="#C7D7E7")
-    ax.set_title("Top spatially variant genes: z-scored log-density heatmap", color="#EAF2FA", fontsize=14)
+    ax.set_title("Top spatially variant genes: hierarchically clustered z-scored log-density heatmap", color="#EAF2FA", fontsize=14)
 
     colorbar = fig.colorbar(image, ax=ax, fraction=0.03, pad=0.02)
     colorbar.ax.tick_params(colors="#C7D7E7", labelsize=8)
