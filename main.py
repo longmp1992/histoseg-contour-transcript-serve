@@ -2505,8 +2505,8 @@ def load_contour_bundle_metadata(
         structure_density_curve_path,
         structure_relative_curve_path,
         gr.update(choices=[], value=None),
-        gr.update(choices=choices, value=choices[:1]),
         {},
+        gr.update(choices=choices, value=choices[:1]),
         state,
     )
 
