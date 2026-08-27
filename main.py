@@ -33,6 +33,7 @@ import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
 from scipy.ndimage import distance_transform_edt
 
 try:
@@ -992,23 +993,26 @@ def render_structure_context_preview(
     selected_ids: set[int],
     output_path: Path,
 ) -> Path:
-    fig, ax = plt.subplots(figsize=(11.5, 10.5))
+    structure_records = bundle_meta["structures"]
+    legend_columns = 1 if len(structure_records) <= 16 else 2 if len(structure_records) <= 32 else 3
+    fig_width = 12.4 + 2.0 * (legend_columns - 1)
+    fig, ax = plt.subplots(figsize=(fig_width, 10.5))
     fig.patch.set_facecolor("#08111B")
     ax.set_facecolor("#08111B")
 
-    color_cycle = plt.cm.tab20(np.linspace(0, 1, max(1, len(bundle_meta["structures"]))))
-    for idx, record in enumerate(bundle_meta["structures"]):
+    color_cycle = plt.cm.tab20(np.linspace(0, 1, max(1, len(structure_records))))
+    legend_handles: list[Line2D] = []
+    for idx, record in enumerate(structure_records):
         color = color_cycle[idx]
         structure_id = int(record["structure_id"])
         selected = structure_id in selected_ids
         line_width = 2.4 if selected else 1.2
         alpha = 0.92 if selected else 0.35
-        label = f"S{structure_id}: {record['structure_name']}" if selected else None
+        label = f"S{structure_id}: {record['structure_name']}"
         for contour in record["polygons"] or []:
             contour_arr = np.asarray(contour, dtype=float)
             ax.plot(contour_arr[:, 0], contour_arr[:, 1], color=color, linewidth=line_width, alpha=alpha)
-        if label is not None:
-            ax.plot([], [], color=color, linewidth=line_width, alpha=alpha, label=label)
+        legend_handles.append(Line2D([], [], color=color, linewidth=line_width, alpha=alpha, label=label))
 
     ax.set_aspect("equal")
     ax.invert_yaxis()
@@ -1018,8 +1022,17 @@ def render_structure_context_preview(
     for spine in ax.spines.values():
         spine.set_color("#294057")
     ax.set_title("Uploaded HistoSeg contours", color="#EAF2FA", fontsize=14)
-    if selected_ids:
-        ax.legend(loc="upper right", fontsize=8, frameon=False, labelcolor="#EAF2FA")
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles,
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1.0),
+            fontsize=8,
+            ncol=legend_columns,
+            frameon=False,
+            labelcolor="#EAF2FA",
+            borderaxespad=0.0,
+        )
 
     fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
