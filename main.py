@@ -1820,6 +1820,171 @@ def aggregate_transcript_distance_counts(
     return gene_counts, stats, bin_edges, area_mm2
 
 
+def build_single_gene_density_curve_frame(
+    *,
+    gene_name: str,
+    transcript_counts: np.ndarray,
+    area_mm2: np.ndarray,
+    bin_edges: np.ndarray,
+) -> pd.DataFrame:
+    counts_arr = np.asarray(transcript_counts, dtype=np.int64)
+    area_arr = np.asarray(area_mm2, dtype=float)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    if len(counts_arr) != len(bin_centers) or len(area_arr) != len(bin_centers):
+        raise ValueError("Single-gene density curve inputs must share the same number of bins.")
+
+    density = np.divide(
+        counts_arr,
+        area_arr,
+        out=np.full(len(bin_centers), np.nan, dtype=float),
+        where=area_arr > 0,
+    )
+    return pd.DataFrame(
+        {
+            "gene": str(gene_name),
+            "bin_center_um": bin_centers.astype(float),
+            "side": np.where(bin_centers < 0, "inside", "outside"),
+            "transcript_count": counts_arr.astype(np.int64),
+            "ring_area_mm2": area_arr.astype(float),
+            "density_per_mm2": density.astype(float),
+        }
+    )
+
+
+def aggregate_single_gene_distance_curve(
+    *,
+    transcript_parquet: Path,
+    transcript_schema: TranscriptInputSchema,
+    target_gene: str,
+    grid_state: dict[str, np.ndarray | float],
+    qv_min: float,
+    max_distance_um: float,
+    bin_width_um: float,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> tuple[pd.DataFrame, dict[str, int | str | float]]:
+    gene_name = str(target_gene).strip()
+    if not gene_name:
+        raise ValueError("Target gene for the density curve cannot be empty.")
+
+    bin_edges = np.arange(-float(max_distance_um), float(max_distance_um) + float(bin_width_um), float(bin_width_um))
+    if len(bin_edges) < 2:
+        raise ValueError("Distance bin edges could not be constructed. Increase max_distance_um or lower bin_width_um.")
+    n_bins = len(bin_edges) - 1
+
+    signed_distance = np.asarray(grid_state["signed_distance"], dtype=float)
+    tissue_mask = np.asarray(grid_state["tissue_mask"], dtype=bool)
+    analysis_mask = np.asarray(grid_state["analysis_mask"], dtype=bool)
+    x0 = float(grid_state["x0"])
+    y0 = float(grid_state["y0"])
+    x1 = float(grid_state["x1"])
+    y1 = float(grid_state["y1"])
+    grid_resolution_um = float(np.asarray(grid_state["xs"])[1] - np.asarray(grid_state["xs"])[0]) if len(np.asarray(grid_state["xs"])) > 1 else 10.0
+
+    area_bin_ids = np.floor((signed_distance - bin_edges[0]) / float(bin_width_um)).astype(np.int64)
+    valid_area_mask = analysis_mask & (area_bin_ids >= 0) & (area_bin_ids < n_bins)
+    area_mm2 = np.array(
+        [float(np.sum(valid_area_mask & (area_bin_ids == index))) * grid_resolution_um * grid_resolution_um / 1e6 for index in range(n_bins)],
+        dtype=float,
+    )
+
+    columns = [transcript_schema.gene_col, transcript_schema.x_col, transcript_schema.y_col]
+    if transcript_schema.qv_col is not None:
+        columns.append(transcript_schema.qv_col)
+    if transcript_schema.is_gene_col is not None:
+        columns.append(transcript_schema.is_gene_col)
+
+    counts = np.zeros(n_bins, dtype=np.int64)
+    stats: dict[str, int | str | float] = {
+        "gene": gene_name,
+        "rows_seen": 0,
+        "rows_matching_gene": 0,
+        "rows_after_quality": 0,
+        "rows_in_bbox": 0,
+        "rows_in_tissue": 0,
+        "rows_in_analysis_region": 0,
+        "rows_in_distance_window": 0,
+        "rows_counted": 0,
+    }
+
+    for batch_df in iter_transcript_batches(transcript_parquet, columns=columns, batch_size=batch_size):
+        stats["rows_seen"] = int(stats["rows_seen"]) + int(len(batch_df))
+        if batch_df.empty:
+            continue
+
+        batch = batch_df.dropna(subset=[transcript_schema.gene_col, transcript_schema.x_col, transcript_schema.y_col]).copy()
+        if batch.empty:
+            continue
+
+        gene_series = batch[transcript_schema.gene_col].astype(str).str.strip()
+        batch = batch.loc[gene_series == gene_name].copy()
+        stats["rows_matching_gene"] = int(stats["rows_matching_gene"]) + int(len(batch))
+        if batch.empty:
+            continue
+
+        if transcript_schema.qv_col is not None and transcript_schema.qv_col in batch.columns:
+            batch = batch.loc[pd.to_numeric(batch[transcript_schema.qv_col], errors="coerce").fillna(-np.inf) >= float(qv_min)].copy()
+        if transcript_schema.is_gene_col is not None and transcript_schema.is_gene_col in batch.columns:
+            batch = batch.loc[batch[transcript_schema.is_gene_col].astype(bool)].copy()
+        stats["rows_after_quality"] = int(stats["rows_after_quality"]) + int(len(batch))
+        if batch.empty:
+            continue
+
+        x_values = pd.to_numeric(batch[transcript_schema.x_col], errors="coerce").to_numpy(dtype=float)
+        y_values = pd.to_numeric(batch[transcript_schema.y_col], errors="coerce").to_numpy(dtype=float)
+        finite_mask = np.isfinite(x_values) & np.isfinite(y_values)
+        if not finite_mask.any():
+            continue
+        x_values = x_values[finite_mask]
+        y_values = y_values[finite_mask]
+
+        in_bbox = (x_values >= x0) & (x_values <= x1) & (y_values >= y0) & (y_values <= y1)
+        stats["rows_in_bbox"] = int(stats["rows_in_bbox"]) + int(in_bbox.sum())
+        if not in_bbox.any():
+            continue
+        x_values = x_values[in_bbox]
+        y_values = y_values[in_bbox]
+
+        x_idx = np.floor((x_values - x0) / grid_resolution_um).astype(np.int64)
+        y_idx = np.floor((y_values - y0) / grid_resolution_um).astype(np.int64)
+        x_idx = np.clip(x_idx, 0, signed_distance.shape[1] - 1)
+        y_idx = np.clip(y_idx, 0, signed_distance.shape[0] - 1)
+
+        in_tissue = tissue_mask[y_idx, x_idx]
+        stats["rows_in_tissue"] = int(stats["rows_in_tissue"]) + int(in_tissue.sum())
+        if not in_tissue.any():
+            continue
+        x_idx = x_idx[in_tissue]
+        y_idx = y_idx[in_tissue]
+
+        in_analysis_region = analysis_mask[y_idx, x_idx]
+        stats["rows_in_analysis_region"] = int(stats["rows_in_analysis_region"]) + int(in_analysis_region.sum())
+        if not in_analysis_region.any():
+            continue
+        x_idx = x_idx[in_analysis_region]
+        y_idx = y_idx[in_analysis_region]
+
+        signed_values = signed_distance[y_idx, x_idx]
+        in_window = np.abs(signed_values) <= float(max_distance_um)
+        stats["rows_in_distance_window"] = int(stats["rows_in_distance_window"]) + int(in_window.sum())
+        if not in_window.any():
+            continue
+        signed_values = signed_values[in_window]
+
+        bin_ids = np.floor((signed_values - bin_edges[0]) / float(bin_width_um)).astype(np.int64)
+        valid_bins = (bin_ids >= 0) & (bin_ids < n_bins)
+        if not valid_bins.any():
+            continue
+        stats["rows_counted"] = int(stats["rows_counted"]) + int(valid_bins.sum())
+        np.add.at(counts, bin_ids[valid_bins], 1)
+
+    return build_single_gene_density_curve_frame(
+        gene_name=gene_name,
+        transcript_counts=counts,
+        area_mm2=area_mm2,
+        bin_edges=bin_edges,
+    ), stats
+
+
 def collect_gene_points_for_overlay(
     *,
     transcript_parquet: Path,
@@ -2035,6 +2200,60 @@ def render_variation_curve_plot(
         spine.set_color("#294057")
     ax.legend(loc="upper right", fontsize=8, ncol=2, frameon=False, labelcolor="#EAF2FA")
     ax.set_title("Top spatially variant genes: normalized distance curves", color="#EAF2FA", fontsize=14)
+
+    fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return output_path
+
+
+def render_single_gene_density_curve_plot(
+    *,
+    curve_df: pd.DataFrame,
+    output_path: Path,
+) -> Path:
+    if curve_df.empty:
+        raise ValueError("No single-gene density curve data were available to render.")
+
+    gene_name = str(curve_df.iloc[0]["gene"])
+    total_transcripts = int(curve_df["transcript_count"].fillna(0).sum())
+    bin_centers = curve_df["bin_center_um"].to_numpy(dtype=float)
+    density = curve_df["density_per_mm2"].to_numpy(dtype=float)
+    plotted_density = np.where(np.isfinite(density), density, np.nan)
+    fill_density = np.nan_to_num(density, nan=0.0)
+
+    fig, ax = plt.subplots(figsize=(11.6, 6.6))
+    fig.patch.set_facecolor("#08111B")
+    ax.set_facecolor("#08111B")
+
+    ax.plot(
+        bin_centers,
+        plotted_density,
+        color="#78B9FF",
+        linewidth=2.2,
+        alpha=0.96,
+        label=f"{gene_name} density",
+    )
+    ax.fill_between(
+        bin_centers,
+        0.0,
+        fill_density,
+        color="#78B9FF",
+        alpha=0.16,
+    )
+
+    ax.axvline(0.0, color="#8AA2B8", linestyle="--", linewidth=1.1)
+    ax.set_xlabel("Signed distance from contour (um)  [<0 inside, >0 outside]", color="#C7D7E7")
+    ax.set_ylabel("Transcript density (per mm^2)", color="#C7D7E7")
+    ax.tick_params(colors="#8096AA")
+    for spine in ax.spines.values():
+        spine.set_color("#294057")
+    ax.grid(color="#173049", linewidth=0.8, alpha=0.35)
+    ax.legend(loc="upper right", fontsize=8, frameon=False, labelcolor="#EAF2FA")
+    ax.set_title(
+        f"Selected gene transcript density curve: {gene_name} (counted={total_transcripts})",
+        color="#EAF2FA",
+        fontsize=14,
+    )
 
     fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -2636,10 +2855,17 @@ def run_contour_transcript_analysis(
         )
         top_gene = str(ranking_df.iloc[0]["gene"])
         overlay_gene_choices = build_overlay_gene_choices(gene_counts)
+        top_gene_curve_df = build_single_gene_density_curve_frame(
+            gene_name=top_gene,
+            transcript_counts=gene_counts[top_gene],
+            area_mm2=area_mm2,
+            bin_edges=bin_edges,
+        )
 
         progress(0.82, desc="Rendering plots")
         top_curve_path = output_dir / "top_spatially_variant_gene_curves.png"
         top_heatmap_path = output_dir / "top_spatially_variant_gene_heatmap.png"
+        selected_gene_curve_path = output_dir / f"selected_gene_{safe_filename_component(top_gene)}_density_curve.png"
         render_variation_curve_plot(
             ranking_df=ranking_df,
             density_wide_df=density_wide_df,
@@ -2667,6 +2893,10 @@ def run_contour_transcript_analysis(
             top_gene=top_gene,
             top_gene_points=top_gene_points,
             output_path=top_overlay_path,
+        )
+        render_single_gene_density_curve_plot(
+            curve_df=top_gene_curve_df,
+            output_path=selected_gene_curve_path,
         )
 
         progress(0.90, desc="Writing output tables")
@@ -2754,6 +2984,7 @@ def run_contour_transcript_analysis(
             "contour_filter": dict(bundle_meta.get("contour_filter", {})),
             "qv_min": float(qv_min),
             "grid_resolution_um": float(grid_resolution_um),
+            "bin_width_um": float(bin_width_um),
             "max_distance_um": float(max_distance_um),
             "selected_structure_labels": selected_labels,
             "default_gene": top_gene,
@@ -2766,6 +2997,7 @@ def run_contour_transcript_analysis(
             str(top_curve_path),
             str(top_heatmap_path),
             str(top_overlay_path),
+            str(selected_gene_curve_path),
             str(ranking_path),
             str(density_wide_path),
             str(long_curves_path),
@@ -2787,7 +3019,7 @@ def run_contour_transcript_analysis(
             f"Genes ranked: {len(ranking_df)}",
             f"Top spatially variant gene: {top_gene}",
             f"Top score: {float(ranking_df.iloc[0]['distance_profile_variation_score']):.4f}",
-            "Interactive overlay: choose a gene in the dropdown and click the overlay button to replot transcripts on the current contour selection.",
+            "Interactive overlay: choose a gene in the dropdown and click the overlay button to replot transcripts plus the matching density curve on the current contour selection.",
             f"Elapsed time: {elapsed} seconds",
         ]
         active_contour_filter = dict(bundle_meta.get("contour_filter", {}))
@@ -2815,6 +3047,7 @@ def run_contour_transcript_analysis(
             str(top_curve_path),
             str(top_heatmap_path),
             str(top_overlay_path),
+            str(selected_gene_curve_path),
             ranking_df.head(200),
             gr.update(choices=overlay_gene_choices, value=top_gene),
             summary,
@@ -2923,6 +3156,15 @@ def render_selected_gene_overlay_for_current_contours(
         grid_resolution_um=float(analysis_state.get("grid_resolution_um", 10.0)),
         max_distance_um=float(analysis_state.get("max_distance_um", 1000.0)),
     )
+    gene_curve_df, gene_curve_stats = aggregate_single_gene_distance_curve(
+        transcript_parquet=transcript_path,
+        transcript_schema=transcript_schema,
+        target_gene=gene_name,
+        grid_state=grid_state,
+        qv_min=float(analysis_state.get("qv_min", 20.0)),
+        max_distance_um=float(analysis_state.get("max_distance_um", 1000.0)),
+        bin_width_um=float(analysis_state.get("bin_width_um", 50.0)),
+    )
     gene_points = collect_gene_points_for_overlay(
         transcript_parquet=transcript_path,
         transcript_schema=transcript_schema,
@@ -2938,6 +3180,7 @@ def render_selected_gene_overlay_for_current_contours(
 
     selected_preview_path = interactive_dir / "selected_structure_context_current.png"
     overlay_path = interactive_dir / f"selected_gene_{safe_filename_component(gene_name)}_overlay.png"
+    curve_path = interactive_dir / f"selected_gene_{safe_filename_component(gene_name)}_density_curve.png"
     render_structure_context_preview(
         bundle_meta=bundle_meta,
         selected_ids=selected_ids,
@@ -2950,7 +3193,15 @@ def render_selected_gene_overlay_for_current_contours(
         top_gene_points=gene_points,
         output_path=overlay_path,
     )
-    return str(selected_preview_path), str(overlay_path)
+    render_single_gene_density_curve_plot(
+        curve_df=gene_curve_df,
+        output_path=curve_path,
+    )
+    log_event(
+        "Interactive gene refresh finished for "
+        f"{gene_name}: counted {int(gene_curve_stats['rows_counted'])} transcripts across the current contour selection."
+    )
+    return str(selected_preview_path), str(overlay_path), str(curve_path)
 
 
 CUSTOM_CSS = """
@@ -3233,6 +3484,9 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
 
     with gr.Row():
         top_overlay_image = gr.Image(label="Selected gene transcript overlay", type="filepath")
+        selected_gene_curve_image = gr.Image(label="Selected gene transcript density curve", type="filepath")
+
+    with gr.Row():
         run_summary = gr.JSON(label="Run summary")
 
     with gr.Row():
@@ -3298,6 +3552,7 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             top_curve_image,
             top_heatmap_image,
             top_overlay_image,
+            selected_gene_curve_image,
             ranking_table,
             overlay_gene_selector,
             run_summary,
@@ -3317,6 +3572,7 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
         outputs=[
             selected_structure_preview,
             top_overlay_image,
+            selected_gene_curve_image,
         ],
     )
 
