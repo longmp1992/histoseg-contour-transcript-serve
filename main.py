@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import binary_erosion, distance_transform_edt
 
 try:
     import pyarrow.parquet as pq
@@ -57,8 +57,9 @@ except Exception as exc:  # pragma: no cover - startup fallback only
 APP_NAME = "HistoSeg Contour Transcript Explorer"
 APP_DESCRIPTION = (
     "A standalone SciLifeLab Serve Gradio app that reads an already generated HistoSeg contour bundle "
-    "plus a Xenium transcript.parquet file, computes signed inward/outward transcript distance curves "
-    "from the selected structure contour, and ranks the most spatially variant genes."
+    "plus a Xenium transcript.parquet file, computes signed contour-distance curves "
+    "with negative values inside selected contours and Voronoi-style positive values outside, "
+    "and ranks the most spatially variant genes."
 )
 INPUT_MODE_UPLOAD = "upload_files"
 INPUT_MODE_STORAGE = "mounted_storage"
@@ -787,6 +788,87 @@ def polygon_from_vertices(vertices: np.ndarray) -> Any | None:
     return poly
 
 
+def build_contour_polygon_records(structure_records: list[dict[str, object]]) -> list[dict[str, object]]:
+    contour_records: list[dict[str, object]] = []
+    for record in structure_records:
+        structure_id = int(record["structure_id"])
+        structure_name = str(record["structure_name"])
+        for contour_index, contour in enumerate(record.get("polygons") or []):
+            polygon = polygon_from_vertices(contour)
+            if polygon is None or polygon.is_empty:
+                continue
+            contour_records.append(
+                {
+                    "structure_id": structure_id,
+                    "structure_name": structure_name,
+                    "contour_index": int(contour_index),
+                    "polygon": polygon,
+                }
+            )
+    return contour_records
+
+
+def grid_slice_for_bounds(
+    *,
+    bounds: tuple[float, float, float, float],
+    x0: float,
+    y0: float,
+    grid_resolution_um: float,
+    shape: tuple[int, int],
+    pad_cells: int = 1,
+) -> tuple[slice, slice]:
+    minx, miny, maxx, maxy = bounds
+    row_start = max(0, int(math.floor((miny - y0) / grid_resolution_um)) - int(pad_cells))
+    row_stop = min(shape[0], int(math.ceil((maxy - y0) / grid_resolution_um)) + int(pad_cells) + 1)
+    col_start = max(0, int(math.floor((minx - x0) / grid_resolution_um)) - int(pad_cells))
+    col_stop = min(shape[1], int(math.ceil((maxx - x0) / grid_resolution_um)) + int(pad_cells) + 1)
+    return slice(row_start, row_stop), slice(col_start, col_stop)
+
+
+def rasterize_contour_boundary_owners(
+    *,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    contour_records: list[dict[str, object]],
+    x0: float,
+    y0: float,
+    grid_resolution_um: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    boundary_mask = np.zeros(gx.shape, dtype=bool)
+    boundary_owner = np.full(gx.shape, -1, dtype=np.int32)
+    erosion_kernel = np.ones((3, 3), dtype=bool)
+
+    for owner_index, contour_record in enumerate(contour_records):
+        polygon = contour_record["polygon"]
+        row_slice, col_slice = grid_slice_for_bounds(
+            bounds=polygon.bounds,
+            x0=float(x0),
+            y0=float(y0),
+            grid_resolution_um=float(grid_resolution_um),
+            shape=gx.shape,
+            pad_cells=1,
+        )
+        sub_gx = gx[row_slice, col_slice]
+        sub_gy = gy[row_slice, col_slice]
+        if sub_gx.size == 0:
+            continue
+
+        inside_mask = contains_xy(polygon, sub_gx.ravel(), sub_gy.ravel()).reshape(sub_gx.shape)
+        if not inside_mask.any():
+            continue
+        boundary_pixels = inside_mask & ~binary_erosion(inside_mask, structure=erosion_kernel, border_value=0)
+        if not boundary_pixels.any():
+            boundary_pixels = inside_mask
+
+        sub_boundary_mask = boundary_mask[row_slice, col_slice]
+        sub_boundary_owner = boundary_owner[row_slice, col_slice]
+        claim_mask = boundary_pixels & ~sub_boundary_mask
+        sub_boundary_owner[claim_mask] = int(owner_index)
+        sub_boundary_mask |= boundary_pixels
+
+    return boundary_mask, boundary_owner
+
+
 def load_contour_bundle(
     bundle_path: Path,
     *,
@@ -1101,6 +1183,8 @@ def build_analysis_grid(
     *,
     selected_geometry: Any,
     tissue_geometry: Any,
+    contour_records: list[dict[str, object]],
+    selected_structure_ids: set[int],
     grid_resolution_um: float,
     max_distance_um: float,
 ) -> dict[str, np.ndarray | float]:
@@ -1118,11 +1202,34 @@ def build_analysis_grid(
     tissue_mask = contains_xy(tissue_geometry, gx.ravel(), gy.ravel()).reshape(gx.shape)
     target_mask = contains_xy(selected_geometry, gx.ravel(), gy.ravel()).reshape(gx.shape)
 
+    boundary_mask, boundary_owner = rasterize_contour_boundary_owners(
+        gx=gx,
+        gy=gy,
+        contour_records=contour_records,
+        x0=float(x0),
+        y0=float(y0),
+        grid_resolution_um=float(grid_resolution_um),
+    )
+    if not boundary_mask.any():
+        raise ValueError("Could not rasterize any contour boundary pixels for Voronoi-style outward expansion.")
+
     inside_dist = distance_transform_edt(target_mask) * float(grid_resolution_um)
     outside_dist = distance_transform_edt(~target_mask) * float(grid_resolution_um)
-    signed_distance = inside_dist.astype(float)
-    signed_distance[~target_mask] = -outside_dist[~target_mask]
-    analysis_mask = tissue_mask & (np.abs(signed_distance) <= float(max_distance_um))
+    _, nearest_indices = distance_transform_edt(~boundary_mask, return_indices=True)
+    nearest_owner = boundary_owner[nearest_indices[0], nearest_indices[1]]
+    selected_owner_ids = {
+        owner_index
+        for owner_index, contour_record in enumerate(contour_records)
+        if int(contour_record["structure_id"]) in selected_structure_ids
+    }
+    outward_voronoi_mask = (~target_mask) & tissue_mask & np.isin(nearest_owner, list(selected_owner_ids))
+
+    signed_distance = outside_dist.astype(float)
+    signed_distance[target_mask] = -inside_dist[target_mask]
+    analysis_mask = (
+        (target_mask & (inside_dist <= float(max_distance_um)))
+        | (outward_voronoi_mask & (outside_dist <= float(max_distance_um)))
+    )
 
     return {
         "x0": float(x0),
@@ -1135,6 +1242,7 @@ def build_analysis_grid(
         "gy": gy,
         "tissue_mask": tissue_mask,
         "target_mask": target_mask,
+        "outward_voronoi_mask": outward_voronoi_mask,
         "signed_distance": signed_distance,
         "analysis_mask": analysis_mask,
     }
@@ -1184,6 +1292,7 @@ def aggregate_transcript_distance_counts(
         "rows_after_quality": 0,
         "rows_in_bbox": 0,
         "rows_in_tissue": 0,
+        "rows_in_analysis_region": 0,
         "rows_in_distance_window": 0,
         "rows_counted": 0,
         "gene_count_pre_filter": 0,
@@ -1243,6 +1352,14 @@ def aggregate_transcript_distance_counts(
         y_idx = y_idx[in_tissue]
         gene_values = gene_values[in_tissue]
 
+        in_analysis_region = analysis_mask[y_idx, x_idx]
+        stats["rows_in_analysis_region"] += int(in_analysis_region.sum())
+        if not in_analysis_region.any():
+            continue
+        x_idx = x_idx[in_analysis_region]
+        y_idx = y_idx[in_analysis_region]
+        gene_values = gene_values[in_analysis_region]
+
         signed_values = signed_distance[y_idx, x_idx]
         in_window = np.abs(signed_values) <= float(max_distance_um)
         stats["rows_in_distance_window"] += int(in_window.sum())
@@ -1288,7 +1405,7 @@ def collect_gene_points_for_overlay(
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> np.ndarray:
     signed_distance = np.asarray(grid_state["signed_distance"], dtype=float)
-    tissue_mask = np.asarray(grid_state["tissue_mask"], dtype=bool)
+    analysis_mask = np.asarray(grid_state["analysis_mask"], dtype=bool)
     x0 = float(grid_state["x0"])
     y0 = float(grid_state["y0"])
     x1 = float(grid_state["x1"])
@@ -1336,7 +1453,7 @@ def collect_gene_points_for_overlay(
         y_idx = np.floor((y_values - y0) / grid_resolution_um).astype(np.int64)
         x_idx = np.clip(x_idx, 0, signed_distance.shape[1] - 1)
         y_idx = np.clip(y_idx, 0, signed_distance.shape[0] - 1)
-        keep = tissue_mask[y_idx, x_idx]
+        keep = analysis_mask[y_idx, x_idx]
         if not keep.any():
             continue
         points = np.column_stack([x_values[keep], y_values[keep]])
@@ -1393,8 +1510,8 @@ def build_curve_outputs(
             entropy_norm = 0.0
         variation_score = float(max(0.0, 1.0 - entropy_norm))
         signed_com_um = float(np.sum(centers_valid * profile))
-        inward_count = int(counts_arr[bin_centers >= 0].sum())
-        outward_count = int(counts_arr[bin_centers < 0].sum())
+        inward_count = int(counts_arr[bin_centers < 0].sum())
+        outward_count = int(counts_arr[bin_centers >= 0].sum())
         peak_index = int(np.nanargmax(np.nan_to_num(density, nan=-1.0)))
         peak_distance_um = float(bin_centers[peak_index])
         peak_density = float(np.nanmax(np.nan_to_num(density, nan=0.0)))
@@ -1418,7 +1535,7 @@ def build_curve_outputs(
                 {
                     "gene": gene_name,
                     "bin_center_um": float(bin_center),
-                    "side": "inside" if float(bin_center) >= 0 else "outside",
+                    "side": "inside" if float(bin_center) < 0 else "outside",
                     "transcript_count": int(transcript_count),
                     "ring_area_mm2": float(area_value),
                     "density_per_mm2": float(density_value) if np.isfinite(density_value) else np.nan,
@@ -1475,7 +1592,7 @@ def render_variation_curve_plot(
         )
 
     ax.axvline(0.0, color="#8AA2B8", linestyle="--", linewidth=1.1)
-    ax.set_xlabel("Signed distance from contour (um)  [<0 outside, >0 inside]", color="#C7D7E7")
+    ax.set_xlabel("Signed distance from contour (um)  [<0 inside, >0 outside]", color="#C7D7E7")
     ax.set_ylabel("Normalized transcript density", color="#C7D7E7")
     ax.tick_params(colors="#8096AA")
     for spine in ax.spines.values():
@@ -1646,6 +1763,8 @@ def load_contour_bundle_metadata(
         f"Structures discovered: {bundle_meta['structure_count']}",
         f"Has structure_contour_metrics.json: {bundle_meta['has_metrics_json']}",
         f"Has cells_with_structure_partition file: {bundle_meta['has_partition_file']}",
+        "Signed distance convention for analysis: negative inside, positive outside.",
+        "Outside expansion rule: Voronoi-style, so outward regions stop when another contour becomes closer.",
         (
             "Contour-cell filter requested: "
             f"{'yes' if filter_contours_by_assigned_cells else 'no'}"
@@ -1773,20 +1892,16 @@ def run_contour_transcript_analysis(
 
         structure_lookup = {int(record["structure_id"]): record for record in bundle_meta["structures"]}
         selected_records = [structure_lookup[structure_id] for structure_id in sorted(selected_ids)]
-        all_polygons = [
-            polygon_from_vertices(contour)
-            for record in bundle_meta["structures"]
-            for contour in (record["polygons"] or [])
-        ]
-        all_polygons = [poly for poly in all_polygons if poly is not None and not poly.is_empty]
+        all_contour_records = build_contour_polygon_records(bundle_meta["structures"])
+        all_polygons = [record["polygon"] for record in all_contour_records]
         if not all_polygons:
             raise ValueError("The contour bundle did not yield any valid polygons after parsing.")
-        selected_polygons = [
-            polygon_from_vertices(contour)
-            for record in selected_records
-            for contour in (record["polygons"] or [])
+        selected_contour_records = [
+            contour_record
+            for contour_record in all_contour_records
+            if int(contour_record["structure_id"]) in selected_ids
         ]
-        selected_polygons = [poly for poly in selected_polygons if poly is not None and not poly.is_empty]
+        selected_polygons = [record["polygon"] for record in selected_contour_records]
         if not selected_polygons:
             raise ValueError("The selected structures did not yield any valid polygons after parsing.")
 
@@ -1808,6 +1923,8 @@ def run_contour_transcript_analysis(
         grid_state = build_analysis_grid(
             selected_geometry=selected_geometry,
             tissue_geometry=tissue_geometry,
+            contour_records=all_contour_records,
+            selected_structure_ids=selected_ids,
             grid_resolution_um=float(grid_resolution_um),
             max_distance_um=float(max_distance_um),
         )
@@ -1876,7 +1993,7 @@ def run_contour_transcript_analysis(
         pd.DataFrame(
             {
                 "bin_center_um": bin_centers,
-                "side": np.where(bin_centers >= 0, "inside", "outside"),
+                "side": np.where(bin_centers < 0, "inside", "outside"),
                 "ring_area_mm2": area_mm2,
             }
         ).to_csv(bin_summary_path, index=False)
@@ -1920,6 +2037,8 @@ def run_contour_transcript_analysis(
                 "max_distance_um": float(max_distance_um),
                 "min_transcripts_per_gene": int(min_transcripts_per_gene),
                 "top_n_genes": int(top_n_genes),
+                "signed_distance_convention": "negative_inside_positive_outside",
+                "outward_assignment_mode": "voronoi_nearest_contour_within_tissue",
             },
             "aggregation_stats": aggregation_stats,
             "top_gene": top_gene,
@@ -1950,6 +2069,8 @@ def run_contour_transcript_analysis(
             f"{APP_NAME} finished successfully.",
             f"Run directory: {run_dir}",
             f"Selected structures analyzed: {len(selected_records)}",
+            "Signed distance convention: negative inside, positive outside.",
+            "Outward expansion mode: Voronoi-style, keeping only points whose nearest contour belongs to the selected structures.",
             f"Transcript rows seen: {aggregation_stats['rows_seen']}",
             f"Transcript rows counted after filtering: {aggregation_stats['rows_counted']}",
             f"Genes ranked: {len(ranking_df)}",
@@ -2115,12 +2236,12 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
               <div class="micro-step">
                 <strong>Step 2</strong>
                 <h3>Select structures</h3>
-                <p>Choose one or more structures whose contour should define the inward/outward transcript distance reference.</p>
+                <p>Choose one or more structures whose contours define the signed distance reference and Voronoi-style outward ownership.</p>
               </div>
               <div class="micro-step">
                 <strong>Step 3</strong>
                 <h3>Analyze transcripts</h3>
-                <p>Upload <code>transcript.parquet</code>, then compute signed-distance curves for all genes from the selected contour.</p>
+                <p>Upload <code>transcript.parquet</code>, then compute signed-distance curves for all genes with negative values inside and positive values outside.</p>
               </div>
               <div class="micro-step">
                 <strong>Step 4</strong>
@@ -2200,7 +2321,10 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             label="Structures to use as the contour reference",
             choices=[],
             value=[],
-            info="Select one or more uploaded structures. If several are selected, their contours are merged into one analysis region.",
+            info=(
+                "Select one or more uploaded structures. Inside each selected contour is treated as negative distance, "
+                "and outward positive-distance regions are assigned Voronoi-style until another contour becomes closer."
+            ),
         )
 
     with gr.Row():
