@@ -765,6 +765,96 @@ def load_partition_cell_counts(
     }
 
 
+def load_bundle_cell_coordinates(bundle_path: Path) -> dict[str, object]:
+    errors: list[str] = []
+    member_candidates = tuple(dict.fromkeys(PARTITION_MEMBER_CANDIDATES + CELL_COORDINATE_MEMBER_CANDIDATES))
+    for member_name in member_candidates:
+        if not bundle_member_exists(bundle_path, member_name):
+            continue
+
+        try:
+            columns = bundle_table_columns(bundle_path, member_name)
+        except Exception as exc:
+            errors.append(f"Could not inspect {member_name}: {exc}")
+            continue
+
+        x_col = first_present_optional_column(columns, CELL_X_COORD_CANDIDATES)
+        y_col = first_present_optional_column(columns, CELL_Y_COORD_CANDIDATES)
+        if x_col is None or y_col is None:
+            errors.append(
+                f"{member_name} did not expose usable cell coordinate columns."
+            )
+            continue
+
+        structure_col = first_present_optional_column(columns, PARTITION_STRUCTURE_ID_CANDIDATES)
+        requested_columns = [x_col, y_col]
+        if structure_col is not None:
+            requested_columns.append(structure_col)
+        try:
+            coord_df = read_bundle_table_subset(bundle_path, member_name, requested_columns)
+        except Exception as exc:
+            errors.append(f"Could not read {member_name}: {exc}")
+            continue
+
+        coord_df = coord_df.dropna(subset=[x_col, y_col]).copy()
+        if coord_df.empty:
+            errors.append(f"{member_name} did not contain usable cell coordinates after removing missing values.")
+            continue
+
+        x_values = pd.to_numeric(coord_df[x_col], errors="coerce").to_numpy(dtype=float)
+        y_values = pd.to_numeric(coord_df[y_col], errors="coerce").to_numpy(dtype=float)
+        finite_mask = np.isfinite(x_values) & np.isfinite(y_values)
+        if not finite_mask.any():
+            errors.append(f"{member_name} did not contain finite numeric cell coordinates after cleanup.")
+            continue
+
+        x_values = x_values[finite_mask]
+        y_values = y_values[finite_mask]
+        structure_assignments = None
+        if structure_col is not None and structure_col in coord_df.columns:
+            structure_values = pd.to_numeric(coord_df[structure_col], errors="coerce").to_numpy(dtype=float)
+            structure_values = structure_values[finite_mask]
+            if np.isfinite(structure_values).any():
+                structure_assignments = structure_values
+
+        notes = []
+        if structure_assignments is not None:
+            notes.append(f"Using {member_name} with assigned-structure column {structure_col}.")
+        else:
+            notes.append(
+                f"Using {member_name} without usable structure assignments; cell curves will use geometric contour membership only."
+            )
+
+        return {
+            "available": True,
+            "reason": None,
+            "member_name": member_name,
+            "x_values": x_values,
+            "y_values": y_values,
+            "structure_assignments": structure_assignments,
+            "structure_col": structure_col if structure_assignments is not None else None,
+            "notes": notes,
+        }
+
+    if not errors:
+        reason = (
+            "No cells_with_structure_partition or cells.parquet file was found in the contour bundle, "
+            "so structure cell density curves could not be rendered."
+        )
+    else:
+        reason = errors[-1]
+    return {
+        "available": False,
+        "reason": reason,
+        "member_name": None,
+        "x_values": np.empty(0, dtype=float),
+        "y_values": np.empty(0, dtype=float),
+        "structure_assignments": None,
+        "structure_col": None,
+        "notes": errors[:-1],
+    }
+
+
 def safe_filename_component(raw: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(raw).strip())
     cleaned = cleaned.strip("._")
@@ -809,14 +899,24 @@ def build_contour_polygon_records(structure_records: list[dict[str, object]]) ->
     return contour_records
 
 
-def compute_structure_area_um2(contours: list[np.ndarray]) -> float | None:
+def build_structure_geometry(contours: list[np.ndarray]) -> Any | None:
     if SHAPELY_IMPORT_ERROR is not None:
         return None
     polygons = [polygon_from_vertices(contour) for contour in contours]
     valid_polygons = [polygon for polygon in polygons if polygon is not None and not polygon.is_empty]
     if not valid_polygons:
         return None
-    return float(unary_union(valid_polygons).area)
+    geometry = unary_union(valid_polygons)
+    if geometry.is_empty:
+        return None
+    return geometry
+
+
+def compute_structure_area_um2(contours: list[np.ndarray]) -> float | None:
+    geometry = build_structure_geometry(contours)
+    if geometry is None:
+        return None
+    return float(geometry.area)
 
 
 def grid_slice_for_bounds(
@@ -1255,6 +1355,139 @@ def build_analysis_grid(
     }
 
 
+def build_structure_inward_cell_density_curves(
+    *,
+    bundle_path: Path,
+    bundle_meta: dict[str, object],
+    grid_resolution_um: float,
+    bin_width_um: float,
+    max_distance_um: float,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    if float(grid_resolution_um) <= 0:
+        raise ValueError("Grid resolution for structure cell density curves must be positive.")
+    if float(bin_width_um) <= 0:
+        raise ValueError("Bin width for structure cell density curves must be positive.")
+    if float(max_distance_um) <= 0:
+        raise ValueError("Maximum inward distance for structure cell density curves must be positive.")
+
+    cell_state = load_bundle_cell_coordinates(bundle_path)
+    if not cell_state.get("available"):
+        return pd.DataFrame(), cell_state
+
+    bin_edges = np.arange(0.0, float(max_distance_um) + float(bin_width_um), float(bin_width_um))
+    if len(bin_edges) < 2:
+        raise ValueError("Could not construct inward-distance bins for structure cell density curves.")
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    n_bins = len(bin_centers)
+
+    all_x = np.asarray(cell_state["x_values"], dtype=float)
+    all_y = np.asarray(cell_state["y_values"], dtype=float)
+    assigned_structure_ids = None
+    assigned_valid_mask = None
+    if cell_state.get("structure_assignments") is not None:
+        structure_assignments = np.asarray(cell_state["structure_assignments"], dtype=float)
+        assigned_valid_mask = np.isfinite(structure_assignments)
+        assigned_structure_ids = np.zeros(len(structure_assignments), dtype=np.int64)
+        assigned_structure_ids[assigned_valid_mask] = structure_assignments[assigned_valid_mask].astype(np.int64)
+
+    rows: list[dict[str, object]] = []
+    rendered_structure_count = 0
+    for record in bundle_meta["structures"]:
+        structure_id = int(record["structure_id"])
+        structure_name = str(record["structure_name"])
+        contours = [np.asarray(contour, dtype=float) for contour in (record.get("polygons") or [])]
+        structure_geometry = build_structure_geometry(contours)
+        if structure_geometry is None or structure_geometry.is_empty:
+            continue
+
+        minx, miny, maxx, maxy = structure_geometry.bounds
+        padding = float(grid_resolution_um)
+        x0 = math.floor((minx - padding) / grid_resolution_um) * grid_resolution_um
+        y0 = math.floor((miny - padding) / grid_resolution_um) * grid_resolution_um
+        x1 = math.ceil((maxx + padding) / grid_resolution_um) * grid_resolution_um
+        y1 = math.ceil((maxy + padding) / grid_resolution_um) * grid_resolution_um
+
+        xs = np.arange(x0, x1 + grid_resolution_um, grid_resolution_um, dtype=float)
+        ys = np.arange(y0, y1 + grid_resolution_um, grid_resolution_um, dtype=float)
+        gx, gy = np.meshgrid(xs + grid_resolution_um / 2.0, ys + grid_resolution_um / 2.0)
+        target_mask = contains_xy(structure_geometry, gx.ravel(), gy.ravel()).reshape(gx.shape)
+        if not target_mask.any():
+            continue
+
+        inside_dist = distance_transform_edt(target_mask) * float(grid_resolution_um)
+        area_bin_ids = np.floor(inside_dist / float(bin_width_um)).astype(np.int64)
+        valid_area_mask = target_mask & (inside_dist <= float(max_distance_um)) & (area_bin_ids >= 0) & (area_bin_ids < n_bins)
+        area_mm2 = np.array(
+            [float(np.sum(valid_area_mask & (area_bin_ids == index))) * grid_resolution_um * grid_resolution_um / 1e6 for index in range(n_bins)],
+            dtype=float,
+        )
+
+        if assigned_structure_ids is not None and assigned_valid_mask is not None:
+            structure_cell_mask = assigned_valid_mask & (assigned_structure_ids == structure_id)
+            x_values = all_x[structure_cell_mask]
+            y_values = all_y[structure_cell_mask]
+        else:
+            x_values = all_x
+            y_values = all_y
+
+        cell_counts = np.zeros(n_bins, dtype=np.int64)
+        if len(x_values):
+            bbox_mask = (x_values >= minx) & (x_values <= maxx) & (y_values >= miny) & (y_values <= maxy)
+            if bbox_mask.any():
+                x_subset = x_values[bbox_mask]
+                y_subset = y_values[bbox_mask]
+                inside_cell_mask = contains_xy(structure_geometry, x_subset, y_subset)
+                if inside_cell_mask.any():
+                    x_inside = x_subset[inside_cell_mask]
+                    y_inside = y_subset[inside_cell_mask]
+                    x_idx = np.floor((x_inside - x0) / grid_resolution_um).astype(np.int64)
+                    y_idx = np.floor((y_inside - y0) / grid_resolution_um).astype(np.int64)
+                    x_idx = np.clip(x_idx, 0, target_mask.shape[1] - 1)
+                    y_idx = np.clip(y_idx, 0, target_mask.shape[0] - 1)
+                    keep = target_mask[y_idx, x_idx] & (inside_dist[y_idx, x_idx] <= float(max_distance_um))
+                    if keep.any():
+                        inward_distances = inside_dist[y_idx[keep], x_idx[keep]]
+                        cell_bin_ids = np.floor(inward_distances / float(bin_width_um)).astype(np.int64)
+                        valid_bins = (cell_bin_ids >= 0) & (cell_bin_ids < n_bins)
+                        if valid_bins.any():
+                            np.add.at(cell_counts, cell_bin_ids[valid_bins], 1)
+
+        density = np.where(area_mm2 > 0, cell_counts / area_mm2, np.nan)
+        structure_label = f"S{structure_id}: {structure_name}"
+        rendered_structure_count += 1
+        for bin_center, cell_count, area_value, density_value in zip(bin_centers, cell_counts, area_mm2, density):
+            rows.append(
+                {
+                    "structure_id": structure_id,
+                    "structure_name": structure_name,
+                    "structure_label": structure_label,
+                    "inward_distance_um": float(bin_center),
+                    "cell_count": int(cell_count),
+                    "ring_area_mm2": float(area_value),
+                    "cell_density_per_mm2": float(density_value) if np.isfinite(density_value) else np.nan,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(), {
+            "available": True,
+            "reason": "No valid structure geometries were available for inward cell density curves.",
+            "member_name": cell_state.get("member_name"),
+            "structure_col": cell_state.get("structure_col"),
+            "notes": list(cell_state.get("notes", [])),
+            "rendered_structure_count": 0,
+        }
+
+    return pd.DataFrame(rows), {
+        "available": True,
+        "reason": None,
+        "member_name": cell_state.get("member_name"),
+        "structure_col": cell_state.get("structure_col"),
+        "notes": list(cell_state.get("notes", [])),
+        "rendered_structure_count": int(rendered_structure_count),
+    }
+
+
 def aggregate_transcript_distance_counts(
     *,
     transcript_parquet: Path,
@@ -1612,6 +1845,62 @@ def render_variation_curve_plot(
     return output_path
 
 
+def render_structure_cell_density_curve_plot(
+    *,
+    curve_df: pd.DataFrame,
+    output_path: Path,
+) -> Path:
+    if curve_df.empty:
+        raise ValueError("No structure cell density curves were available to render.")
+
+    structure_rows = (
+        curve_df[["structure_id", "structure_name", "structure_label"]]
+        .drop_duplicates()
+        .sort_values(["structure_id", "structure_name"])
+        .reset_index(drop=True)
+    )
+    legend_columns = 1 if len(structure_rows) <= 16 else 2 if len(structure_rows) <= 32 else 3
+    palette = plt.cm.tab20(np.linspace(0, 1, max(1, len(structure_rows))))
+
+    fig, ax = plt.subplots(figsize=(12.6, 8.8))
+    fig.patch.set_facecolor("#08111B")
+    ax.set_facecolor("#08111B")
+
+    for color, row in zip(palette, structure_rows.itertuples(index=False)):
+        structure_df = curve_df.loc[curve_df["structure_id"] == int(row.structure_id)].sort_values("inward_distance_um")
+        ax.plot(
+            structure_df["inward_distance_um"].to_numpy(dtype=float),
+            structure_df["cell_density_per_mm2"].to_numpy(dtype=float),
+            color=color,
+            linewidth=2.0,
+            alpha=0.92,
+            label=str(row.structure_label),
+        )
+
+    ax.axvline(0.0, color="#8AA2B8", linestyle="--", linewidth=1.1)
+    ax.set_xlim(left=0.0)
+    ax.set_xlabel("Inward distance from own contour (um)", color="#C7D7E7")
+    ax.set_ylabel("Cell density (cells per mm^2)", color="#C7D7E7")
+    ax.tick_params(colors="#8096AA")
+    for spine in ax.spines.values():
+        spine.set_color("#294057")
+    ax.grid(color="#173049", linewidth=0.8, alpha=0.35)
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        fontsize=8,
+        ncol=legend_columns,
+        frameon=False,
+        labelcolor="#EAF2FA",
+        borderaxespad=0.0,
+    )
+    ax.set_title("Structure cell density curves inside their own contours", color="#EAF2FA", fontsize=14)
+
+    fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return output_path
+
+
 def render_variation_heatmap(
     *,
     ranking_df: pd.DataFrame,
@@ -1745,6 +2034,9 @@ def load_contour_bundle_metadata(
     contour_bundle_storage_path: str | None,
     filter_contours_by_assigned_cells: bool,
     min_assigned_cells_threshold: float,
+    grid_resolution_um: float,
+    bin_width_um: float,
+    max_distance_um: float,
 ):
     if SHAPELY_IMPORT_ERROR is not None:
         raise gr.Error(
@@ -1774,6 +2066,50 @@ def load_contour_bundle_metadata(
 
     preview_path = preview_dir / "contour_bundle_preview.png"
     render_structure_context_preview(bundle_meta=bundle_meta, selected_ids=selected_ids, output_path=preview_path)
+
+    structure_density_curve_path: str | None = None
+    structure_density_curve_notes: list[str] = []
+    try:
+        structure_curve_df, structure_curve_meta = build_structure_inward_cell_density_curves(
+            bundle_path=bundle_input.path,
+            bundle_meta=bundle_meta,
+            grid_resolution_um=float(grid_resolution_um),
+            bin_width_um=float(bin_width_um),
+            max_distance_um=float(max_distance_um),
+        )
+        if not structure_curve_df.empty:
+            density_curve_path = preview_dir / "structure_cell_density_curves.png"
+            render_structure_cell_density_curve_plot(
+                curve_df=structure_curve_df,
+                output_path=density_curve_path,
+            )
+            structure_density_curve_path = str(density_curve_path)
+            if structure_curve_meta.get("structure_col"):
+                structure_density_curve_notes.append(
+                    "Rendered inward-only structure cell density curves using assigned structure IDs from "
+                    f"{structure_curve_meta.get('member_name')} ({structure_curve_meta.get('structure_col')})."
+                )
+            else:
+                structure_density_curve_notes.append(
+                    "Rendered inward-only structure cell density curves using geometric contour membership from "
+                    f"{structure_curve_meta.get('member_name')}."
+                )
+            structure_density_curve_notes.append(
+                "Curve settings: "
+                f"grid resolution {float(grid_resolution_um):.1f} um, "
+                f"bin width {float(bin_width_um):.1f} um, "
+                f"max inward distance {float(max_distance_um):.1f} um."
+            )
+        else:
+            structure_density_curve_notes.append(
+                "Structure cell density curves were skipped: "
+                f"{structure_curve_meta.get('reason') or 'no usable structure cell information was available.'}"
+            )
+        for note in structure_curve_meta.get("notes", []):
+            structure_density_curve_notes.append(f"Curve note: {note}")
+    except Exception as exc:
+        log_event(f"Structure density curve preview failed: {exc}")
+        structure_density_curve_notes.append(f"Structure cell density curves were skipped: {exc}")
 
     status_lines = [
         f"Loaded contour bundle: {bundle_input.original}",
@@ -1807,6 +2143,7 @@ def load_contour_bundle_metadata(
             )
     for note in contour_filter.get("notes", []):
         status_lines.append(f"Filter note: {note}")
+    status_lines.extend(structure_density_curve_notes)
     if removed_previews:
         status_lines.append(f"Cleaned old preview directories: {', '.join(removed_previews)}")
 
@@ -1838,6 +2175,7 @@ def load_contour_bundle_metadata(
         "\n".join(status_lines),
         str(preview_path),
         structure_table,
+        structure_density_curve_path,
         gr.update(choices=choices, value=choices[:1]),
         state,
     )
@@ -2388,6 +2726,12 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
         ranking_table = gr.Dataframe(label="Top ranked spatially variant genes", interactive=False, wrap=True)
 
     with gr.Row():
+        structure_density_curve_image = gr.Image(
+            label="Structure cell density curves (inward only, all structures)",
+            type="filepath",
+        )
+
+    with gr.Row():
         top_curve_image = gr.Image(label="Top spatially variant gene curves", type="filepath")
         top_heatmap_image = gr.Image(label="Top spatially variant gene heatmap", type="filepath")
 
@@ -2418,11 +2762,15 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             contour_bundle_storage_path,
             filter_contours_by_assigned_cells,
             min_assigned_cells_threshold,
+            grid_resolution_um,
+            bin_width_um,
+            max_distance_um,
         ],
         outputs=[
             contour_status,
             contour_preview,
             structure_table,
+            structure_density_curve_image,
             structure_selector,
             bundle_state,
         ],
