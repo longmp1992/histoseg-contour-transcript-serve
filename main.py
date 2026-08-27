@@ -1987,6 +1987,16 @@ def build_curve_outputs(
     return ranking_df, density_wide_df, long_curves_df
 
 
+def build_overlay_gene_choices(gene_counts: dict[str, np.ndarray]) -> list[tuple[str, str]]:
+    gene_totals: list[tuple[str, int]] = []
+    for gene_name, counts in gene_counts.items():
+        total_count = int(np.asarray(counts, dtype=np.int64).sum())
+        if total_count > 0:
+            gene_totals.append((str(gene_name), total_count))
+    gene_totals.sort(key=lambda item: (-item[1], item[0]))
+    return [(f"{gene_name} | counted={total_count}", gene_name) for gene_name, total_count in gene_totals]
+
+
 def render_variation_curve_plot(
     *,
     ranking_df: pd.DataFrame,
@@ -2275,7 +2285,7 @@ def render_top_gene_overlay(
     ax.tick_params(colors="#7F96AC", labelsize=8)
     for spine in ax.spines.values():
         spine.set_color("#294057")
-    ax.set_title(f"Top spatially variant gene overlay: {top_gene}", color="#EAF2FA", fontsize=14)
+    ax.set_title(f"Selected gene transcript overlay: {top_gene}", color="#EAF2FA", fontsize=14)
     if len(top_gene_points):
         ax.legend(loc="upper right", fontsize=8, frameon=False, labelcolor="#EAF2FA")
 
@@ -2494,7 +2504,9 @@ def load_contour_bundle_metadata(
         structure_table,
         structure_density_curve_path,
         structure_relative_curve_path,
+        gr.update(choices=[], value=None),
         gr.update(choices=choices, value=choices[:1]),
+        {},
         state,
     )
 
@@ -2623,6 +2635,7 @@ def run_contour_transcript_analysis(
             min_transcripts_per_gene=int(min_transcripts_per_gene),
         )
         top_gene = str(ranking_df.iloc[0]["gene"])
+        overlay_gene_choices = build_overlay_gene_choices(gene_counts)
 
         progress(0.82, desc="Rendering plots")
         top_curve_path = output_dir / "top_spatially_variant_gene_curves.png"
@@ -2726,6 +2739,25 @@ def run_contour_transcript_analysis(
             "genes_ranked": int(len(ranking_df)),
             "elapsed_seconds": elapsed,
         }
+        analysis_state = {
+            "contour_bundle_path": str(contour_input.path),
+            "transcript_parquet_path": str(transcript_input.path),
+            "output_dir": str(output_dir),
+            "choice_to_id": label_to_id,
+            "transcript_schema": {
+                "gene_col": transcript_schema.gene_col,
+                "x_col": transcript_schema.x_col,
+                "y_col": transcript_schema.y_col,
+                "qv_col": transcript_schema.qv_col,
+                "is_gene_col": transcript_schema.is_gene_col,
+            },
+            "contour_filter": dict(bundle_meta.get("contour_filter", {})),
+            "qv_min": float(qv_min),
+            "grid_resolution_um": float(grid_resolution_um),
+            "max_distance_um": float(max_distance_um),
+            "selected_structure_labels": selected_labels,
+            "default_gene": top_gene,
+        }
         params_path = output_dir / "params.json"
         params_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -2755,6 +2787,7 @@ def run_contour_transcript_analysis(
             f"Genes ranked: {len(ranking_df)}",
             f"Top spatially variant gene: {top_gene}",
             f"Top score: {float(ranking_df.iloc[0]['distance_profile_variation_score']):.4f}",
+            "Interactive overlay: choose a gene in the dropdown and click the overlay button to replot transcripts on the current contour selection.",
             f"Elapsed time: {elapsed} seconds",
         ]
         active_contour_filter = dict(bundle_meta.get("contour_filter", {}))
@@ -2783,14 +2816,141 @@ def run_contour_transcript_analysis(
             str(top_heatmap_path),
             str(top_overlay_path),
             ranking_df.head(200),
+            gr.update(choices=overlay_gene_choices, value=top_gene),
             summary,
             str(archive_path) if archive_path is not None else None,
             output_files,
+            analysis_state,
         )
     except Exception as exc:
         log_event(f"Contour transcript run failed: {exc}")
         print(traceback.format_exc(), flush=True)
         raise gr.Error(str(exc))
+
+
+def render_selected_gene_overlay_for_current_contours(
+    selected_gene: str | None,
+    selected_structure_labels: list[str] | None,
+    analysis_state: dict[str, object] | None,
+):
+    if SHAPELY_IMPORT_ERROR is not None:
+        raise gr.Error(
+            "Shapely could not be imported inside the app container. "
+            f"Import error: {SHAPELY_IMPORT_ERROR}"
+        )
+    if not analysis_state:
+        raise gr.Error("Run the contour transcript analysis first to enable interactive gene overlays.")
+
+    gene_name = str(selected_gene or "").strip()
+    if not gene_name:
+        raise gr.Error("Choose a gene transcript before plotting the interactive overlay.")
+
+    selected_labels = list(selected_structure_labels or [])
+    if not selected_labels:
+        raise gr.Error("Select at least one structure contour before plotting the interactive overlay.")
+
+    contour_bundle_raw = str(analysis_state.get("contour_bundle_path") or "").strip()
+    transcript_raw = str(analysis_state.get("transcript_parquet_path") or "").strip()
+    output_dir_raw = str(analysis_state.get("output_dir") or "").strip()
+    if not contour_bundle_raw:
+        raise gr.Error("The contour bundle path for this analysis is missing. Run the analysis again.")
+    if not transcript_raw:
+        raise gr.Error("The transcript.parquet path for this analysis is missing. Run the analysis again.")
+    if not output_dir_raw:
+        raise gr.Error("The output directory for this analysis is missing. Run the analysis again.")
+
+    contour_bundle_path = Path(contour_bundle_raw).resolve()
+    transcript_path = Path(transcript_raw).resolve()
+    if not contour_bundle_path.exists():
+        raise gr.Error("The staged contour bundle for this analysis is no longer available. Run the analysis again.")
+    if not transcript_path.exists():
+        raise gr.Error("The staged transcript.parquet file for this analysis is no longer available. Run the analysis again.")
+
+    contour_filter_state = dict(analysis_state.get("contour_filter", {}))
+    bundle_meta = load_contour_bundle(
+        contour_bundle_path,
+        include_polygons=True,
+        filter_contours_by_assigned_cells=bool(contour_filter_state.get("requested", False)),
+        min_assigned_cells_threshold=int(contour_filter_state.get("min_assigned_cells_threshold", 10)),
+    )
+
+    label_to_id = {str(label): int(structure_id) for label, structure_id in dict(analysis_state.get("choice_to_id", {})).items()}
+    if not label_to_id:
+        label_to_id = {
+            build_structure_choice_label(record): int(record["structure_id"])
+            for record in bundle_meta["structures"]
+        }
+    selected_ids = {int(label_to_id[label]) for label in selected_labels if label in label_to_id}
+    if not selected_ids:
+        raise gr.Error("The current structure selection could not be resolved back to contour IDs. Reload the bundle if needed.")
+
+    all_contour_records = build_contour_polygon_records(bundle_meta["structures"])
+    all_polygons = [record["polygon"] for record in all_contour_records]
+    if not all_polygons:
+        raise gr.Error("The contour bundle did not yield any valid polygons for the interactive overlay.")
+
+    selected_contour_records = [
+        contour_record
+        for contour_record in all_contour_records
+        if int(contour_record["structure_id"]) in selected_ids
+    ]
+    selected_polygons = [record["polygon"] for record in selected_contour_records]
+    if not selected_polygons:
+        raise gr.Error("The selected structures did not yield any valid polygons for the interactive overlay.")
+
+    selected_geometry = unary_union(selected_polygons)
+    tissue_geometry = unary_union(all_polygons)
+    transcript_schema_state = dict(analysis_state.get("transcript_schema", {}))
+    transcript_schema = TranscriptInputSchema(
+        gene_col=str(transcript_schema_state["gene_col"]),
+        x_col=str(transcript_schema_state["x_col"]),
+        y_col=str(transcript_schema_state["y_col"]),
+        qv_col=(
+            str(transcript_schema_state["qv_col"])
+            if transcript_schema_state.get("qv_col") is not None
+            else None
+        ),
+        is_gene_col=(
+            str(transcript_schema_state["is_gene_col"])
+            if transcript_schema_state.get("is_gene_col") is not None
+            else None
+        ),
+    )
+    grid_state = build_analysis_grid(
+        selected_geometry=selected_geometry,
+        tissue_geometry=tissue_geometry,
+        contour_records=selected_contour_records,
+        grid_resolution_um=float(analysis_state.get("grid_resolution_um", 10.0)),
+        max_distance_um=float(analysis_state.get("max_distance_um", 1000.0)),
+    )
+    gene_points = collect_gene_points_for_overlay(
+        transcript_parquet=transcript_path,
+        transcript_schema=transcript_schema,
+        target_gene=gene_name,
+        grid_state=grid_state,
+        qv_min=float(analysis_state.get("qv_min", 20.0)),
+        max_points=DEFAULT_TOP_GENE_SAMPLE,
+    )
+
+    output_dir = Path(output_dir_raw).resolve()
+    interactive_dir = output_dir / "interactive_overlay"
+    interactive_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_preview_path = interactive_dir / "selected_structure_context_current.png"
+    overlay_path = interactive_dir / f"selected_gene_{safe_filename_component(gene_name)}_overlay.png"
+    render_structure_context_preview(
+        bundle_meta=bundle_meta,
+        selected_ids=selected_ids,
+        output_path=selected_preview_path,
+    )
+    render_top_gene_overlay(
+        bundle_meta=bundle_meta,
+        selected_ids=selected_ids,
+        top_gene=gene_name,
+        top_gene_points=gene_points,
+        output_path=overlay_path,
+    )
+    return str(selected_preview_path), str(overlay_path)
 
 
 CUSTOM_CSS = """
@@ -2938,6 +3098,7 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
     )
 
     bundle_state = gr.State(value={})
+    analysis_state = gr.State(value={})
 
     with gr.Row():
         input_mode = gr.Radio(
@@ -3033,6 +3194,19 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
         run_button = gr.Button("2. Run contour transcript analysis", variant="primary")
 
     with gr.Row():
+        overlay_gene_selector = gr.Dropdown(
+            label="Gene transcript to overlay on the current contour selection",
+            choices=[],
+            value=None,
+            interactive=True,
+            filterable=True,
+        )
+        render_selected_gene_button = gr.Button(
+            "3. Plot selected gene transcript on current contours",
+            variant="secondary",
+        )
+
+    with gr.Row():
         contour_status = gr.Textbox(label="Status", lines=10)
 
     with gr.Row():
@@ -3058,7 +3232,7 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
         top_heatmap_image = gr.Image(label="Top spatially variant gene heatmap", type="filepath")
 
     with gr.Row():
-        top_overlay_image = gr.Image(label="Top gene spatial overlay", type="filepath")
+        top_overlay_image = gr.Image(label="Selected gene transcript overlay", type="filepath")
         run_summary = gr.JSON(label="Run summary")
 
     with gr.Row():
@@ -3094,6 +3268,8 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             structure_table,
             structure_density_curve_image,
             structure_relative_curve_image,
+            overlay_gene_selector,
+            analysis_state,
             structure_selector,
             bundle_state,
         ],
@@ -3123,9 +3299,24 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             top_heatmap_image,
             top_overlay_image,
             ranking_table,
+            overlay_gene_selector,
             run_summary,
             archive_file,
             output_files,
+            analysis_state,
+        ],
+    )
+
+    render_selected_gene_button.click(
+        fn=render_selected_gene_overlay_for_current_contours,
+        inputs=[
+            overlay_gene_selector,
+            structure_selector,
+            analysis_state,
+        ],
+        outputs=[
+            selected_structure_preview,
+            top_overlay_image,
         ],
     )
 
