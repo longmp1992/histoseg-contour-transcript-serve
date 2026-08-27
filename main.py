@@ -1355,6 +1355,74 @@ def build_analysis_grid(
     }
 
 
+def build_structure_raster_context(
+    *,
+    bundle_meta: dict[str, object],
+    grid_resolution_um: float,
+) -> dict[str, object]:
+    if float(grid_resolution_um) <= 0:
+        raise ValueError("Grid resolution for structure rasterization must be positive.")
+
+    structure_info: dict[int, dict[str, object]] = {}
+    structure_geometries: list[Any] = []
+    for record in bundle_meta["structures"]:
+        structure_id = int(record["structure_id"])
+        structure_name = str(record["structure_name"])
+        contours = [np.asarray(contour, dtype=float) for contour in (record.get("polygons") or [])]
+        geometry = build_structure_geometry(contours)
+        if geometry is None or geometry.is_empty:
+            continue
+        structure_info[structure_id] = {
+            "structure_id": structure_id,
+            "structure_name": structure_name,
+            "structure_label": f"S{structure_id}: {structure_name}",
+            "geometry": geometry,
+        }
+        structure_geometries.append(geometry)
+
+    if not structure_info:
+        return {
+            "available": False,
+            "reason": "No valid structure geometries were available for rasterized structure previews.",
+            "structure_info": {},
+            "structure_masks": {},
+            "tissue_mask": np.zeros((0, 0), dtype=bool),
+        }
+
+    tissue_geometry = unary_union(structure_geometries)
+    minx, miny, maxx, maxy = tissue_geometry.bounds
+    padding = float(grid_resolution_um)
+    x0 = math.floor((minx - padding) / grid_resolution_um) * grid_resolution_um
+    y0 = math.floor((miny - padding) / grid_resolution_um) * grid_resolution_um
+    x1 = math.ceil((maxx + padding) / grid_resolution_um) * grid_resolution_um
+    y1 = math.ceil((maxy + padding) / grid_resolution_um) * grid_resolution_um
+
+    xs = np.arange(x0, x1 + grid_resolution_um, grid_resolution_um, dtype=float)
+    ys = np.arange(y0, y1 + grid_resolution_um, grid_resolution_um, dtype=float)
+    gx, gy = np.meshgrid(xs + grid_resolution_um / 2.0, ys + grid_resolution_um / 2.0)
+    tissue_mask = contains_xy(tissue_geometry, gx.ravel(), gy.ravel()).reshape(gx.shape)
+
+    structure_masks: dict[int, np.ndarray] = {}
+    for structure_id, entry in structure_info.items():
+        structure_masks[structure_id] = contains_xy(entry["geometry"], gx.ravel(), gy.ravel()).reshape(gx.shape)
+
+    return {
+        "available": True,
+        "reason": None,
+        "x0": float(x0),
+        "y0": float(y0),
+        "x1": float(x1),
+        "y1": float(y1),
+        "xs": xs,
+        "ys": ys,
+        "gx": gx,
+        "gy": gy,
+        "tissue_mask": tissue_mask,
+        "structure_info": structure_info,
+        "structure_masks": structure_masks,
+    }
+
+
 def build_structure_inward_cell_density_curves(
     *,
     bundle_path: Path,
@@ -1485,6 +1553,124 @@ def build_structure_inward_cell_density_curves(
         "structure_col": cell_state.get("structure_col"),
         "notes": list(cell_state.get("notes", [])),
         "rendered_structure_count": int(rendered_structure_count),
+    }
+
+
+def build_structure_relative_outward_curves(
+    *,
+    bundle_meta: dict[str, object],
+    grid_resolution_um: float,
+    bin_width_um: float,
+    max_distance_um: float,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    if float(bin_width_um) <= 0:
+        raise ValueError("Bin width for relative structure curves must be positive.")
+    if float(max_distance_um) <= 0:
+        raise ValueError("Maximum outward distance for relative structure curves must be positive.")
+
+    raster_context = build_structure_raster_context(
+        bundle_meta=bundle_meta,
+        grid_resolution_um=float(grid_resolution_um),
+    )
+    if not raster_context.get("available"):
+        return pd.DataFrame(), raster_context
+
+    bin_edges = np.arange(0.0, float(max_distance_um) + float(bin_width_um), float(bin_width_um))
+    if len(bin_edges) < 2:
+        raise ValueError("Could not construct outward-distance bins for relative structure curves.")
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    n_bins = len(bin_centers)
+    grid_resolution_um = float(grid_resolution_um)
+    cell_area_mm2 = grid_resolution_um * grid_resolution_um / 1e6
+
+    tissue_mask = np.asarray(raster_context["tissue_mask"], dtype=bool)
+    structure_info = dict(raster_context["structure_info"])
+    structure_masks = {
+        int(structure_id): np.asarray(mask, dtype=bool)
+        for structure_id, mask in dict(raster_context["structure_masks"]).items()
+    }
+
+    rows: list[dict[str, object]] = []
+    pair_count = 0
+    skipped_sources: list[int] = []
+    for source_id in sorted(structure_info):
+        source_mask = structure_masks[source_id]
+        outside_dist = distance_transform_edt(~source_mask) * grid_resolution_um
+        shell_bin_ids = np.floor(outside_dist / float(bin_width_um)).astype(np.int64)
+        valid_shell_mask = (
+            (~source_mask)
+            & tissue_mask
+            & (outside_dist <= float(max_distance_um))
+            & (shell_bin_ids >= 0)
+            & (shell_bin_ids < n_bins)
+        )
+        if not valid_shell_mask.any():
+            skipped_sources.append(source_id)
+            continue
+
+        shell_bins = shell_bin_ids[valid_shell_mask]
+        shell_counts = np.bincount(shell_bins, minlength=n_bins).astype(float)
+        shell_area_mm2 = shell_counts * cell_area_mm2
+        source_hits = 0
+        for target_id in sorted(structure_info):
+            if target_id == source_id:
+                continue
+            overlap_mask = valid_shell_mask & structure_masks[target_id]
+            if not overlap_mask.any():
+                continue
+
+            target_bins = shell_bin_ids[overlap_mask]
+            target_counts = np.bincount(target_bins, minlength=n_bins).astype(float)
+            if not np.any(target_counts > 0):
+                continue
+
+            source_hits += 1
+            pair_count += 1
+            target_area_mm2 = target_counts * cell_area_mm2
+            target_fraction_pct = np.divide(
+                100.0 * target_counts,
+                shell_counts,
+                out=np.full(n_bins, np.nan, dtype=float),
+                where=shell_counts > 0,
+            )
+            source_name = str(structure_info[source_id]["structure_name"])
+            target_name = str(structure_info[target_id]["structure_name"])
+            pair_label = f"S{source_id} -> S{target_id}"
+            for bin_center, shell_area_value, target_area_value, target_fraction_value in zip(
+                bin_centers,
+                shell_area_mm2,
+                target_area_mm2,
+                target_fraction_pct,
+            ):
+                rows.append(
+                    {
+                        "source_structure_id": int(source_id),
+                        "source_structure_name": source_name,
+                        "target_structure_id": int(target_id),
+                        "target_structure_name": target_name,
+                        "pair_label": pair_label,
+                        "outward_distance_um": float(bin_center),
+                        "shell_area_mm2": float(shell_area_value),
+                        "target_area_mm2": float(target_area_value),
+                        "target_area_fraction_pct": float(target_fraction_value) if np.isfinite(target_fraction_value) else np.nan,
+                    }
+                )
+        if source_hits == 0:
+            skipped_sources.append(source_id)
+
+    if not rows:
+        return pd.DataFrame(), {
+            "available": True,
+            "reason": "No outward structure-overlap curves were available within the current distance window.",
+            "pair_count": 0,
+            "skipped_sources": skipped_sources,
+        }
+
+    return pd.DataFrame(rows), {
+        "available": True,
+        "reason": None,
+        "pair_count": int(pair_count),
+        "skipped_sources": skipped_sources,
     }
 
 
@@ -1901,6 +2087,95 @@ def render_structure_cell_density_curve_plot(
     return output_path
 
 
+def render_structure_relative_curve_plot(
+    *,
+    curve_df: pd.DataFrame,
+    output_path: Path,
+) -> Path:
+    if curve_df.empty:
+        raise ValueError("No relative structure curves were available to render.")
+
+    pair_rows = (
+        curve_df[
+            [
+                "source_structure_id",
+                "source_structure_name",
+                "target_structure_id",
+                "target_structure_name",
+                "pair_label",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            [
+                "source_structure_id",
+                "target_structure_id",
+                "source_structure_name",
+                "target_structure_name",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+    if pair_rows.empty:
+        raise ValueError("No relative structure pairs were available to render.")
+
+    source_ids = pair_rows["source_structure_id"].drop_duplicates().astype(int).tolist()
+    source_palette = {
+        source_id: color
+        for source_id, color in zip(source_ids, plt.cm.tab20(np.linspace(0, 1, max(1, len(source_ids)))))
+    }
+    line_styles = ["-", "--", "-.", ":"]
+    legend_columns = 1 if len(pair_rows) <= 16 else 2 if len(pair_rows) <= 32 else 3
+
+    fig, ax = plt.subplots(figsize=(12.8, 8.8))
+    fig.patch.set_facecolor("#08111B")
+    ax.set_facecolor("#08111B")
+
+    for source_id in source_ids:
+        source_pairs = pair_rows.loc[pair_rows["source_structure_id"] == int(source_id)].reset_index(drop=True)
+        for pair_index, row in enumerate(source_pairs.itertuples(index=False)):
+            pair_df = curve_df.loc[
+                (curve_df["source_structure_id"] == int(row.source_structure_id))
+                & (curve_df["target_structure_id"] == int(row.target_structure_id))
+            ].sort_values("outward_distance_um")
+            ax.plot(
+                pair_df["outward_distance_um"].to_numpy(dtype=float),
+                pair_df["target_area_fraction_pct"].to_numpy(dtype=float),
+                color=source_palette[int(source_id)],
+                linestyle=line_styles[pair_index % len(line_styles)],
+                linewidth=1.9,
+                alpha=0.94,
+                label=str(row.pair_label),
+            )
+
+    ax.set_xlim(left=0.0)
+    ax.set_ylim(0.0, 100.0)
+    ax.set_xlabel("Outward distance from source contour (um)", color="#C7D7E7")
+    ax.set_ylabel("Swept area occupied by target structure (%)", color="#C7D7E7")
+    ax.tick_params(colors="#8096AA")
+    for spine in ax.spines.values():
+        spine.set_color("#294057")
+    ax.grid(color="#173049", linewidth=0.8, alpha=0.35)
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        fontsize=8,
+        ncol=legend_columns,
+        frameon=False,
+        labelcolor="#EAF2FA",
+        borderaxespad=0.0,
+    )
+    ax.set_title(
+        "Relative outward structure curves: target-area fraction in each source ring",
+        color="#EAF2FA",
+        fontsize=14,
+    )
+
+    fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return output_path
+
+
 def render_variation_heatmap(
     *,
     ranking_df: pd.DataFrame,
@@ -2069,6 +2344,8 @@ def load_contour_bundle_metadata(
 
     structure_density_curve_path: str | None = None
     structure_density_curve_notes: list[str] = []
+    structure_relative_curve_path: str | None = None
+    structure_relative_curve_notes: list[str] = []
     try:
         structure_curve_df, structure_curve_meta = build_structure_inward_cell_density_curves(
             bundle_path=bundle_input.path,
@@ -2111,6 +2388,45 @@ def load_contour_bundle_metadata(
         log_event(f"Structure density curve preview failed: {exc}")
         structure_density_curve_notes.append(f"Structure cell density curves were skipped: {exc}")
 
+    try:
+        structure_relative_df, structure_relative_meta = build_structure_relative_outward_curves(
+            bundle_meta=bundle_meta,
+            grid_resolution_um=float(grid_resolution_um),
+            bin_width_um=float(bin_width_um),
+            max_distance_um=float(max_distance_um),
+        )
+        if not structure_relative_df.empty:
+            relative_curve_path = preview_dir / "structure_relative_outward_curves.png"
+            render_structure_relative_curve_plot(
+                curve_df=structure_relative_df,
+                output_path=relative_curve_path,
+            )
+            structure_relative_curve_path = str(relative_curve_path)
+            structure_relative_curve_notes.append(
+                "Rendered outward-only relative structure curves. Each line shows the percentage of a source "
+                "structure's outward ring area that overlaps a target structure within the uploaded contour map."
+            )
+            structure_relative_curve_notes.append(
+                "Relative-curve settings: "
+                f"grid resolution {float(grid_resolution_um):.1f} um, "
+                f"bin width {float(bin_width_um):.1f} um, "
+                f"max outward distance {float(max_distance_um):.1f} um."
+            )
+            skipped_sources = list(structure_relative_meta.get("skipped_sources", []))
+            if skipped_sources:
+                skipped_label = ", ".join(f"S{int(structure_id)}" for structure_id in skipped_sources)
+                structure_relative_curve_notes.append(
+                    f"Relative-curve note: no outward overlap with other structures was found for {skipped_label} within the current distance window."
+                )
+        else:
+            structure_relative_curve_notes.append(
+                "Relative structure curves were skipped: "
+                f"{structure_relative_meta.get('reason') or 'no outward structure-overlap data was available.'}"
+            )
+    except Exception as exc:
+        log_event(f"Structure relative curve preview failed: {exc}")
+        structure_relative_curve_notes.append(f"Relative structure curves were skipped: {exc}")
+
     status_lines = [
         f"Loaded contour bundle: {bundle_input.original}",
         f"Bundle type: {bundle_meta['bundle_kind']}",
@@ -2144,6 +2460,7 @@ def load_contour_bundle_metadata(
     for note in contour_filter.get("notes", []):
         status_lines.append(f"Filter note: {note}")
     status_lines.extend(structure_density_curve_notes)
+    status_lines.extend(structure_relative_curve_notes)
     if removed_previews:
         status_lines.append(f"Cleaned old preview directories: {', '.join(removed_previews)}")
 
@@ -2176,6 +2493,7 @@ def load_contour_bundle_metadata(
         str(preview_path),
         structure_table,
         structure_density_curve_path,
+        structure_relative_curve_path,
         gr.update(choices=choices, value=choices[:1]),
         state,
     )
@@ -2730,6 +3048,10 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             label="Structure cell density curves (inward only, all structures)",
             type="filepath",
         )
+        structure_relative_curve_image = gr.Image(
+            label="Relative outward structure curves",
+            type="filepath",
+        )
 
     with gr.Row():
         top_curve_image = gr.Image(label="Top spatially variant gene curves", type="filepath")
@@ -2771,6 +3093,7 @@ with gr.Blocks(title=APP_NAME, css=CUSTOM_CSS, fill_width=True) as demo:
             contour_preview,
             structure_table,
             structure_density_curve_image,
+            structure_relative_curve_image,
             structure_selector,
             bundle_state,
         ],
